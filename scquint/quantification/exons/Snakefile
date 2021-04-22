@@ -1,0 +1,92 @@
+import anndata
+import numpy as np
+import pandas as pd
+import scipy.sparse as sp_sparse
+
+from scquint.utils import filter_min_cells_per_feature, filter_singletons, relabel
+
+
+bam_paths = pd.read_csv(config["bam_paths"], "\t", index_col=0, header=None, names=["bam"])
+print(bam_paths)
+sample_ids = bam_paths.index.values
+min_bin_size = config.get("min_bin_size", 3)
+
+
+rule all:
+    input:
+        "adata.h5ad"
+
+
+# flattenGTF provided by subread package /bin/utilities
+rule extract_bins_from_gtf:
+    input:
+        config["gtf_path"]
+    output:
+        "output/bins_raw.bed"
+    shell:
+        "flattenGTF -C -a {input} -o {output}"
+
+
+rule organize_bins:
+    input:
+        "output/bins_raw.bed"
+    output:
+        "output/bins_full.bed"
+    shell:
+        """tail -n+2 {input} | awk '{{print $2 "\t" $3 "\t" $4 "\t" $1}}' | awk '$3 - $2 >= {min_bin_size}' | bedtools sort -i stdin > {output}"""
+
+
+rule filter_overlapping_bins:
+    input:
+        "output/bins_full.bed"
+    output:
+        "output/bins_nooverlaps.bed"
+    shell:
+        "bedtools intersect -a {input} -b {input} -c -sorted | awk '$5 == 1' | cut -f1-4 > {output}"
+
+
+rule prepare_bins_for_coverage:
+    input:
+        "output/bins_nooverlaps.bed"
+    output:
+        "output/bins_for_coverage.bed"
+    shell:
+        """awk '{{print $1 "\t" $2 "\t" $3 "\t" NR-1}}' {input} > {output}"""
+
+
+rule find_coverage:
+    input:
+        "output/bins_for_coverage.bed",
+        lambda wildcards: bam_paths.loc[wildcards.sample_id].bam
+    output:
+        temp("coverage/{sample_id}.txt")
+    shell:
+        "bedtools coverage -a {input[0]} -b {input[1]} -split -sorted -counts | cut -f 4-5 | awk '$2 > 0' > {output}"
+
+
+rule build_adata:
+    input:
+        "output/bins_nooverlaps.bed",
+        expand("coverage/{sample_id}.txt", sample_id=sample_ids)
+    output:
+        "adata.h5ad"
+    run:
+        var = pd.read_csv(input[0], "\t", header=None, names=["chromosome", "start", "end", "gene_id"])
+        print(var)
+        X = sp_sparse.lil_matrix((len(sample_ids), len(var)), dtype=int)
+        for i, sample_id in enumerate(sample_ids):
+            if i % 100 == 0: print(i)
+            x = np.loadtxt(f"coverage/{sample_id}.txt", dtype=int)
+            X[i, x[:,0]] = x[:,1]
+        X = X.tocsr()
+        var["cluster"] = relabel(var.gene_id)
+        adata = anndata.AnnData(X=X, obs=pd.DataFrame(index=sample_ids), var=var)
+        print(adata.shape)
+        adata = filter_min_cells_per_feature(adata, config.get("min_cells_per_exon", 30))
+        print(adata.shape)
+        adata = filter_singletons(adata)
+        print(adata.shape)
+        adata.var["original_cluster"] = adata.var.cluster
+        adata.write(output[0], compression="gzip")
+
+

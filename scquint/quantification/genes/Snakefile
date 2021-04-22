@@ -1,0 +1,53 @@
+import anndata
+import numpy as np
+import pandas as pd
+import scipy.sparse as sp_sparse
+
+from scquint.utils import filter_min_cells_per_feature, filter_singletons, relabel
+
+
+bam_paths = pd.read_csv(config["bam_paths"], "\t", index_col=0, header=None, names=["bam"])
+print(bam_paths)
+sample_ids = bam_paths.index.values
+
+
+rule all:
+    input:
+        "adata.h5ad",
+
+
+rule quantify_expression:
+    input:
+        config["gtf_path"],
+        lambda wildcards: bam_paths.loc[wildcards.sample_id].bam,
+    output:
+        temp('output/expression/{sample_id}.txt'),
+        temp('output/expression/{sample_id}.txt.summary'),
+    shell:
+        "featureCounts -p -t exon -g gene_id -a {input[0]} -o {output[0]} {input[1]}"
+
+
+rule build_adata:
+    input:
+        expand("output/expression/{sample_id}.txt", sample_id=sample_ids)
+    output:
+        "adata.h5ad"
+    run:
+        gene_ids = pd.read_csv(input[0], "\t", header=None, skiprows=2, names=["gene_id", "chr", "start", "end", "strand", "length", "counts"]).gene_id.values.ravel()
+        print(gene_ids[:10])
+        n_cells = len(sample_ids)
+        n_genes = len(gene_ids)
+        X = np.empty((n_cells, n_genes), dtype=int)
+        for i, filename in enumerate(input):
+            if i % 100 == 0: print('scanning cell ', i)
+            counts = pd.read_csv(filename, "\t", header=None, skiprows=2, names=["gene_id", "chr", "start", "end", "strand", "length", "counts"]).counts.values.ravel()
+            X[i] = counts
+        n_cells_per_gene = (X>0).sum(axis=0)
+        print(X.shape)
+        idx = n_cells_per_gene >= int(config["min_cells_per_gene"])
+        X = X[:,idx]
+        gene_ids = gene_ids[idx]
+        print(X.shape)
+        X = sp_sparse.csr_matrix(X)
+        adata = anndata.AnnData(X, obs=pd.DataFrame(index=sample_ids), var=pd.DataFrame(index=gene_ids))
+        adata.write_h5ad(output[0], compression="gzip")

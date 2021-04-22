@@ -1,0 +1,471 @@
+from collections import Counter, defaultdict
+from glob import glob
+from shutil import copyfile
+
+import anndata
+import networkx as nx
+import numpy as np
+import pandas as pd
+from scipy import sparse as sp_sparse
+
+from scquint.utils import filter_min_cells_per_feature, filter_singletons, relabel
+
+
+min_cells_per_intron = config.get('min_cells_per_intron', 30)
+min_intron_length = config.get('min_intron_length', 50)
+max_intron_length = config.get('max_intron_length', 1000000)
+min_overhang_all_junctions = config.get("min_overhang_all_junctions", 6)
+
+
+
+bam_paths = pd.read_csv(config['bam_paths'], "\t", header=None, index_col=0, names=["bam"])
+print(bam_paths)
+sample_ids = bam_paths.index.values
+
+chromosomes = pd.read_csv(config["chromosomes_path"], header=None).values.ravel().astype(str)
+print("len(chromosomes): ", len(chromosomes))
+
+
+rule all:
+    input:
+        "output/introns-shared-acceptor/adata.h5ad",
+
+
+# this requires name sorted, so it has the mates together
+# assuming it is sorted by coord
+rule bam2junc:
+    input:
+        lambda wildcards: bam_paths.loc[wildcards.sample_id].bam,
+    output:
+        temp('junc_files/{sample_id}.junc'),
+    shell:
+        "samtools sort -n -l 0 {input} | samtools view | sjFromSAMcollapseUandM_filter_min_overhang.awk -v minOverhang={min_overhang_all_junctions} | cut -f1-4 | sort -V > {output}"
+        #"samtools sort -n -I 0 {input}| samtools view {input} | sjFromSAMcollapseUandM_filter_min_overhang.awk -v minOverhang={min_overhang_all_junctions} | cut -f1-4 | sort -V > {output}"
+
+
+def find_clusters(introns, chromosome):
+    # this keeps the same order
+    A = introns[:,0]
+    B = introns[:,1]
+    idx = np.zeros(len(introns), dtype=bool)
+    clusters = np.empty(len(introns), dtype=object)
+
+    nodes = np.arange(len(introns))
+    G = nx.Graph()
+    for node in nodes:
+        G.add_node(node)
+    for n1 in nodes:
+        for n2 in nodes:
+            if n1 < n2:
+                if A[n1] == A[n2] or B[n1] == B[n2]:
+                    G.add_edge(n1, n2)
+
+    connected_components = list(nx.connected_components(G))
+    for i, connected_component in enumerate(connected_components):
+        # if len(connected_component) < 2: continue
+        for intron_id in connected_component:
+            idx[intron_id] = True
+            clusters[intron_id] = '{}_{}'.format(chromosome, i)
+
+    return introns[idx], clusters[idx]
+
+
+rule chromosome_intron_counts:
+    input:
+        expand('junc_files/{sample_id}.junc', sample_id=sample_ids)
+    output:
+        temp('{chromosome}.introns.txt'),
+        temp('{chromosome}.X.npz'),
+        temp('{chromosome}.intron_clusters.txt')
+    threads: 3
+    run:
+        # raise Exception('should filter out singletons for the moment')
+        print(wildcards.chromosome)
+        n_cells = len(input)
+
+        n_cells_per_intron = defaultdict(int)
+        cell_counts = [defaultdict(int) for _ in range(n_cells)]
+
+        for i, filename in enumerate(input):
+            if i % 1000 == 0: print('scanning cell ', i)
+            with open(filename) as f:
+                for line in f:
+                    #chrom, A, B, dot, counts, strand = line.split()
+                    chrom, A, B, counts = line.split()
+                    if chrom != wildcards.chromosome: continue
+                    A, B = int(A), int(B)+1
+                    assert(A < B)
+                    if B-A > int(max_intron_length): continue
+                    # assuming there are no duplicate lines of the same intron
+                    n_cells_per_intron[A,B] += 1
+                    cell_counts[i][A,B] += int(counts)  # or = counts??
+
+        introns = np.array([[intron[0], intron[1]] for (intron,n_cells) in n_cells_per_intron.items()
+                            if n_cells >= min_cells_per_intron])
+        del n_cells_per_intron
+        import gc
+        gc.collect()
+
+        introns = np.array(sorted(introns.tolist()))
+
+        n_introns = len(introns)
+        print('n_introns after min_cells: ', n_introns)
+
+        if n_introns > 0:
+            introns, intron_clusters = find_clusters(introns, wildcards.chromosome)
+            n_introns = len(introns)
+        else:
+            intron_clusters = []
+
+        X = sp_sparse.dok_matrix((n_cells,n_introns), dtype=int)
+
+        for i in range(n_cells):
+            if i % 1000 == 0: print('building cell ', i)
+            cell = cell_counts[i]
+            for j in range(n_introns):
+                intron = introns[j]
+                intron = (intron[0], intron[1])
+                count = cell[intron]
+                if count > 0:
+                    X[i,j] = count
+            cell_counts[i].clear() # del is dangerous, moves indexes around
+
+        introns = [(wildcards.chromosome,intron[0],intron[1]) for intron in introns]
+        pd.DataFrame(introns).to_csv(output[0], '\t', header=False, index=False)
+        sp_sparse.save_npz(output[1], X.tocsc())
+        pd.DataFrame(intron_clusters).to_csv(output[2], header=False, index=False)
+
+
+rule merge_intron_counts:
+    input:
+        introns = expand('{chromosome}.introns.txt', chromosome=chromosomes),
+        intron_clusters = expand('{chromosome}.intron_clusters.txt', chromosome=chromosomes),
+        Xs = expand('{chromosome}.X.npz', chromosome=chromosomes)
+    output:
+        temp("raw_output/X_spl.npz"),
+        temp("raw_output/introns.txt"),
+        temp("raw_output/intron_clusters.txt"),
+    run:
+        all_X = [sp_sparse.load_npz(f) for f in input.Xs]
+        X = sp_sparse.hstack(all_X).tocsr()
+        sp_sparse.save_npz(output[0], X)
+        shell('cat {input.introns} > {output[1]}')
+        shell('cat {input.intron_clusters} > {output[2]}')
+
+
+rule get_exon_coordinates:
+    input:
+        config["gtf_path"]
+    output:
+        temp("output/exon_coordinates.bed"),
+    shell:
+        # "grep exon {input} | cut -f 1,4,5 | sed 's/MT/M/' | sed 's/^/chr/' > {output}"
+        "grep exon {input} | cut -f 1,4,5  > {output}"
+
+
+rule get_exon_genes:
+    input:
+        config["gtf_path"]
+    output:
+        temp("output/exon_genes.bed"),
+    shell:
+        "grep exon {input} | python -m scquint.quantification.extract_genes_from_gtf > {output}"
+
+
+rule get_exons:
+    input:
+        "output/exon_coordinates.bed",
+        "output/exon_genes.bed"
+    output:
+        temp("output/exons.bed"),
+    shell:
+        "paste {input[0]} {input[1]} > {output}"
+
+
+rule get_left_exons:
+    input:
+        "output/exons.bed"
+    output:
+        temp("output/exons_left.bed"),
+    shell:
+        """awk '{{print $1 "\t" $2 "\t" $2+1 "\t" $4}}' {input} > {output}"""
+
+
+rule get_right_exons:
+    input:
+        "output/exons.bed"
+    output:
+        temp("output/exons_right.bed"),
+    shell:
+        """awk '{{print $1 "\t" $3 "\t" $3+1 "\t" $4}}' {input} > {output}"""
+
+
+rule get_left_right_exons:
+    input:
+        "output/exons_left.bed",
+        "output/exons_right.bed"
+    output:
+        temp("output/exons_left_right.bed"),
+    shell:
+        "cat {input} | bedtools sort -i stdin > {output}"
+
+
+rule get_left_introns:
+    input:
+        "raw_output/introns.txt",
+    output:
+        temp("output/introns_left.bed"),
+    shell:
+        """awk '{{print $1 "\t" $2 "\t" $2+1 "\t" NR}}' {input} | bedtools sort -i stdin > {output}"""
+
+
+rule get_right_introns:
+    input:
+        "raw_output/introns.txt",
+    output:
+        temp("output/introns_right.bed"),
+    shell:
+        """awk '{{print $1 "\t" $3 "\t" $3+1 "\t" NR}}' {input} | bedtools sort -i stdin > {output}"""
+
+
+rule left_introns_intersection_exons:
+    input:
+        "output/introns_left.bed",
+        "output/exons_left_right.bed"
+    output:
+        temp("output/introns_left_intersection.bed"),
+    shell:
+        "bedtools slop -b 1 -i {input[0]} -g {config[chrom_sizes_path]} | bedtools map -a stdin -b {input[1]} -c 4,4 -o count,distinct | cut -f4-6 | sort -k1n | cut -f2-3 > {output}"
+
+
+rule right_introns_intersection_exons:
+    input:
+        "output/introns_right.bed",
+        "output/exons_left_right.bed"
+    output:
+        temp("output/introns_right_intersection.bed"),
+    shell:
+        "bedtools slop -b 1 -i {input[0]} -g {config[chrom_sizes_path]} | bedtools map -a stdin -b {input[1]} -c 4,4 -o count,distinct | cut -f4-6 | sort -k1n | cut -f2-3 > {output}"
+
+
+def refine_clusters(X, var, filter_singletons=True):
+    chromo = var.chromosome.values
+    A = var.start.values
+    B = var.end.values
+    idx = np.zeros(len(var), dtype=bool)
+    intron_clusters = var.cluster.values.astype(str)
+
+    all_clusters = np.unique(intron_clusters)
+    cluster_counter = Counter(intron_clusters)
+    for c in all_clusters:
+        counts = cluster_counter[c]
+        if filter_singletons and counts < 2: continue
+        G = nx.Graph()
+        nodes = np.where(intron_clusters==c)[0]
+        for node in nodes:
+            G.add_node(node)
+        for n1 in nodes:
+            for n2 in nodes:
+                if n1 < n2:
+                    if A[n1] == A[n2] or B[n1] == B[n2]:
+                        G.add_edge(n1, n2)
+        connected_components = list(nx.connected_components(G))
+        for i, connected_component in enumerate(connected_components):
+            if filter_singletons and len(connected_component) < 2: continue
+            for intron_id in connected_component:
+                idx[intron_id] = True
+                intron_clusters[intron_id] += '_'+ str(i)
+
+    X = X[:,idx]
+    var = var[idx]
+    var.cluster = relabel(intron_clusters[idx])
+    var= var.reset_index(drop=True)
+    return X, var
+
+
+rule build_adata_splicing:
+    input:
+        "raw_output/X_spl.npz",
+        "raw_output/introns.txt",
+        "raw_output/intron_clusters.txt",
+        "output/introns_left_intersection.bed",
+        "output/introns_right_intersection.bed",
+        config["sjdb_path"]
+    output:
+        "output/introns-{grouping}/adata.h5ad"
+    run:
+        annotated_junctions_df = pd.read_csv(config["sjdb_path"], "\t", header=None,
+                                             names=["chromosome", "start", "end", "strand"])
+        annotated_junctions_set = set([tuple(x) for x in annotated_junctions_df[["chromosome", "start", "end"]].values.tolist()])
+
+        var_spl = pd.read_csv(input[1], '\t', header=None, names=["chromosome", "start", "end"])
+        var_spl["cluster"] = pd.read_csv(input[2], header=None).values.ravel()
+
+        introns_left_intersection = pd.read_csv("output/introns_left_intersection.bed", "\t", header=None)
+        var_spl["left_exon_count"] = introns_left_intersection[0].astype(int)
+
+        var_spl["left_genes"] = introns_left_intersection[1].str.split(",").apply(lambda x: list(filter(lambda y: y != ".", x)))
+
+        introns_right_intersection = pd.read_csv("output/introns_right_intersection.bed", "\t", header=None)
+        var_spl["right_exon_count"] = introns_right_intersection[0].astype(int)
+        var_spl["right_genes"] = introns_right_intersection[1].str.split(",").apply(lambda x: list(filter(lambda y: y != ".", x)))
+
+        print("Hardcoding unification of Foxp1 and Gm20696")
+        var_spl.left_genes = var_spl.left_genes.apply(lambda genes: list(filter(lambda gene: gene != "ENSMUSG00000030068", genes)))
+        var_spl.right_genes = var_spl.right_genes.apply(lambda genes: list(filter(lambda gene: gene != "ENSMUSG00000030068", genes)))
+
+        var_spl["genes"] = (var_spl.left_genes + var_spl.right_genes).apply(set).apply(list)
+        var_spl["n_genes"] = [len(genes) for genes in var_spl.genes.values]
+        groupby_cluster = var_spl.groupby("cluster").genes.agg(sum).apply(set).apply(list)
+
+        var_spl["genes_cluster"] = groupby_cluster.loc[var_spl.cluster].values
+        var_spl["n_genes_cluster"] = var_spl.genes_cluster.apply(len)
+        print("(var_spl.n_genes == 0).sum()", (var_spl.n_genes == 0).sum())
+        print("(var_spl.n_genes_cluster == 0).sum()", (var_spl.n_genes_cluster == 0).sum())
+        print(var_spl[var_spl.n_genes_cluster == 0])
+
+        var_spl["annotated"] = [(row.chromosome, row.start, row.end-1) in annotated_junctions_set for index, row in var_spl.iterrows()]
+        print(var_spl.annotated.value_counts())
+
+        n_genes_left, n_genes_right, n_intersection = zip(*[(len(genes_l), len(genes_r), len(set(genes_l).intersection(set(genes_r)))) for genes_l, genes_r in zip(var_spl.left_genes.values, var_spl.right_genes.values)])
+        n_genes_left = np.array(n_genes_left)
+        n_genes_right = np.array(n_genes_right)
+        n_intersection = np.array(n_intersection)
+        possible_gene_fusion_artifact = (
+            (~var_spl.annotated.values) & (n_genes_left > 0) & (n_genes_right > 0) & (n_intersection == 0))
+        print("possible gene fusion artifact: ", possible_gene_fusion_artifact.sum())
+
+        print("var_spl.shape: ", var_spl.shape)
+        X_spl = sp_sparse.load_npz(input[0]).tocsr()
+        n_cells_per_intron = (X_spl > 0).sum(axis=0).A1
+        intron_length = (var_spl.end - var_spl.start).values
+        print("max intron length: ", np.max(intron_length))
+        print("proportion bigger: ", (intron_length > max_intron_length).sum())
+        print("too few cells: ", (n_cells_per_intron < min_cells_per_intron).sum())
+        print("too short: ", (intron_length < min_intron_length).sum())
+        print("too long: ", (intron_length > max_intron_length).sum())
+        idx1 = (
+            (n_cells_per_intron >= min_cells_per_intron) &
+            (intron_length >= min_intron_length) &
+            (intron_length <= max_intron_length) &
+            # (~possible_gene_fusion_artifact) &
+            #(var_spl.n_genes_cluster == 1).values
+            (var_spl.n_genes == 1).values
+            # & (var_spl.annotated.values)
+        )
+
+        X_spl = X_spl[:,idx1]
+        var_spl = var_spl.iloc[idx1]
+        print("var_spl.shape: ", var_spl.shape)
+        var_spl = var_spl.reset_index(drop=True)
+        #var_spl["gene_id"] = [gl[0] for gl in var_spl.genes_cluster.values]
+        var_spl["gene_id"] = [gl[0] for gl in var_spl.genes.values]
+
+        if wildcards["grouping"] == "nontransitive":
+            left_clusters = defaultdict(list)
+            right_clusters = defaultdict(list)
+
+            for i, intron in var_spl.iterrows():
+                chromo = intron.chromosome
+                A = intron.start
+                B = intron.end
+                left_clusters[(chromo, A)].append(int(i))
+                right_clusters[(chromo, B)].append(int(i))
+
+            def remove_singletons(clusters):
+                return {k: v for k, v in clusters.items() if len(v) > 1}
+
+            left_clusters = remove_singletons(left_clusters)
+            right_clusters = remove_singletons(right_clusters)
+
+            introns_left = np.concatenate(list(left_clusters.values()))
+            introns_right = np.concatenate(list(right_clusters.values()))
+
+            introns_idx = np.concatenate([introns_left, introns_right])
+            X_spl = X_spl[:,introns_idx]
+            var_spl = var_spl.iloc[introns_idx]
+            var_spl = var_spl.reset_index(drop=True)
+
+            intron_clusters = np.empty(len(var_spl), dtype=int)
+
+            accum = 0
+            for i, cluster in enumerate(left_clusters.values()):
+                n = len(cluster)
+                intron_clusters[np.arange(n) + accum] = i
+                accum += len(cluster)
+
+            offset_clusters = len(left_clusters)
+
+            for i, cluster in enumerate(right_clusters.values()):
+                n = len(cluster)
+                intron_clusters[np.arange(n) + accum] = i + offset_clusters
+                accum += len(cluster)
+
+            var_spl.cluster = intron_clusters
+        elif wildcards["grouping"] == "transitive":
+            X_spl, var_spl = refine_clusters(X_spl, var_spl, filter_singletons=True)
+        elif wildcards["grouping"] == "gene":
+            intron_clusters = var_spl.cluster.values
+            #var_spl["gene"] = [gl[0] for gl in var_spl.genes.values]
+            for i, gene_id in enumerate(var_spl.gene_id.unique()):
+                intron_clusters[var_spl.gene_id==gene_id] = i
+            var_spl.cluster = intron_clusters
+        else:
+            raise Exception(f"Grouping {grouping} not supported.")
+
+        adata = anndata.AnnData(X_spl, obs=pd.DataFrame(index=sample_ids), var=var_spl)
+        print(adata.shape)
+        adata = filter_min_cells_per_feature(adata, min_cells_per_intron)
+        print(adata.shape)
+        adata = filter_singletons(adata)
+        print(adata.shape)
+        adata.var["original_cluster"] = adata.var.cluster
+        adata.write_h5ad(output[0], compression="gzip")
+
+
+rule get_gene_strand:
+    input:
+        config["gtf_path"]
+    output:
+        temp("output/gene_strand.txt"),
+    run:
+        df = pd.read_csv(
+            input[0], '\t', header=None, comment="#",
+            names=['chromosome', 'source', 'feature', 'start', 'end', 'score', 'strand', 'frame', 'attribute'],
+        )
+        df = df[df.feature=="gene"]
+        df['gene_id'] = df.attribute.str.extract(r'gene_id "([^;]*)";')
+        groupby = df.groupby("gene_id").strand.first()
+        groupby.to_csv(output[0], "\t")
+
+
+rule separate_introns:
+    input:
+        "output/introns-nontransitive/adata.h5ad",
+        "output/gene_strand.txt",
+    output:
+        "output/introns-shared-acceptor/adata.h5ad",
+        "output/introns-shared-donor/adata.h5ad",
+    run:
+        adata = anndata.read_h5ad(input[0])
+        groupby = adata.var.groupby("cluster").start.nunique().to_frame().rename(columns={"start": "n_start"})
+        adata.var = adata.var.merge(groupby, how="left", left_on="cluster", right_index=True)
+        gene_strand = pd.read_csv(input[1], "\t")
+        adata.var = adata.var.merge(gene_strand, how="left", left_on="gene_id", right_on="gene_id")
+
+        def get_cluster_type(intron):
+            if intron.strand == "+":
+                return "shared_donor" if intron.n_start == 1 else "shared_acceptor"
+            elif intron.strand == "-":
+                return "shared_donor" if intron.n_start > 1 else "shared_acceptor"
+            else:
+                return "unknown"
+
+        adata.var["cluster_type"] = adata.var.apply(get_cluster_type, axis=1)
+        adata.var.index = adata.var.index.astype(str)
+        adata_shared_acceptor = adata[:, np.where(adata.var.cluster_type=="shared_acceptor")[0]].copy()
+        adata_shared_acceptor = filter_min_cells_per_feature(adata_shared_acceptor, 1)  # just to relabel
+        adata_shared_acceptor.write(output[0], compression="gzip")
+        adata_shared_donor = adata[:, np.where(adata.var.cluster_type=="shared_donor")[0]].copy()
+        adata_shared_donor = filter_min_cells_per_feature(adata_shared_donor, 1)  # just to relabel
+        adata_shared_donor.write(output[1], compression="gzip")

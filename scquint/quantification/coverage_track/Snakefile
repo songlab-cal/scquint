@@ -1,0 +1,57 @@
+import numpy as np
+import pandas as pd
+
+bam_paths = pd.read_csv(config['bam_paths'], "\t", header=None, index_col=0, names=["bam"])
+print(bam_paths)
+sample_ids = bam_paths.index.values
+n_batches = int(np.sqrt(len(sample_ids)))
+batches = np.arange(n_batches)
+
+
+rule all:
+    input:
+        "coverage.bw"
+
+
+rule get_sample_cov:
+    input:
+        lambda wildcards: bam_paths.loc[wildcards.sample_id].bam,
+    output:
+        temp("coverage/sample/{sample_id}.bed")
+    shell:
+        "bedtools genomecov -bg -split -ibam {input} > {output}"
+
+
+rule merge_cov_batch:
+    input:
+        lambda wildcards: expand(
+            "coverage/sample/{sample_id}.bed",
+            sample_id=sample_ids[int(wildcards.batch)::n_batches]
+        )
+    output:
+        temp("coverage/batch/{batch}.bed")
+    shell:
+        """
+        bedtools unionbedg -i {input} | awk '{{for (i=4;i<=NF;i++) sum+=$i; print $1 "\t" $2 "\t" $3 "\t" sum; sum=0}}' > "{output}"
+        """
+
+
+rule merge_cov_all:
+    input:
+        expand("coverage/batch/{batch}.bed", batch=batches)
+    output:
+        temp("coverage.bed")
+    shell:
+        """
+        bedtools unionbedg -i {input} | awk '{{for (i=4;i<=NF;i++) sum+=$i; print $1 "\t" $2 "\t" $3 "\t" sum; sum=0}}' | awk '$4 >= 10' > "{output}"
+        """
+
+
+rule convert_to_bigwig:
+    input:
+        "coverage.bed",
+        config["chrom_sizes_path"]
+    output:
+        "coverage.bw"
+    shell:
+        "bedGraphToBigWig {input[0]} {input[1]} {output:q}"
