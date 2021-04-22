@@ -47,11 +47,13 @@ def _run_differential_splicing(
         adata = filter_min_cells_per_cluster(adata, min_cells_per_cluster, cell_idx_a)
         adata = filter_min_cells_per_cluster(adata, min_cells_per_cluster, cell_idx_b)
     if adata.shape[1] == 0: return pd.DataFrame(), pd.DataFrame()
+    print("Number of intron clusters: ", len(adata.var.cluster.unique()))
+    print("Number of introns: ", len(adata.var))
 
 
     def run_regression(i):
         if i % 100 == 0:
-            print(i)
+            print("Testing intron cluster ", i)
         adata_cluster = adata[:, adata.var.cluster==i].copy()  # Excessive copying. Else it's giving a lot of warnings
         cells_to_use = np.where(adata_cluster.X.sum(axis=1).A1 > 0)[0]
         adata_cluster = adata_cluster[cells_to_use].copy()
@@ -104,7 +106,7 @@ def _run_differential_splicing(
         tested_clusters, tested_p_values, ll_null, ll, n_classes, tested_vars = zip(*[run_regression(i) for i in adata.var.cluster.unique()])
     df_cluster = pd.DataFrame(dict(cluster=tested_clusters, p_value=tested_p_values, ll_null=ll_null, ll=ll, n_classes=n_classes))
     df_intron = pd.concat(tested_vars, ignore_index=True)
-
+    print("Done")
     return df_cluster, df_intron
 
 

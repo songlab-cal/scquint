@@ -10,7 +10,8 @@ install_requires = [
     "scikit-learn",
     "snakemake",
     "statsmodels",
-    "scikit-bio",
+    "scikit-bio>=0.5.5",
+    "joblib",
 ]
 
 
