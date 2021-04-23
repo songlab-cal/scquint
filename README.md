@@ -6,6 +6,9 @@ git clone https://github.com/songlab-cal/scquint.git
 cd scquint
 pip install .
 ```
+Read mapping and intron quantification also require STAR, samtools and bedtools. An easy way to install is via conda:
+
+```conda install -c bioconda star samtools bedtools```
 
 ## Read mapping
 Our read mapping workflow, using [STAR](https://github.com/alexdobin/STAR), is designed for reliable detection of novel junctions. However, it is very computationally demanding. Users should consider going directly to intron quantification step if they already have produced bam alignment files. 
