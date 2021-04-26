@@ -24,6 +24,8 @@ Our read mapping workflow, using [STAR](https://github.com/alexdobin/STAR), is d
 
 `sjdb_path`: annotated junctions in the format of `STAR_index/sjdbList.out.tab`.
 
+Precomputed AnnData objects are available at https://github.com/songlab-cal/scquint-analysis.
+
 ## Differential splicing
 See `differential_splicing_example.ipynb`.
 
