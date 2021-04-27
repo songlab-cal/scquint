@@ -30,4 +30,5 @@ Precomputed AnnData objects are available at https://github.com/songlab-cal/scqu
 See `differential_splicing_example.ipynb`.
 
 ## Citation
-TODO
+Benegas, G., Fischer, J., Song., Y.S. Robust and annotation-free analysis of isoform variation using short-read scRNA-seq data. 
+[bioRxiv preprint.](https://www.biorxiv.org/content/10.1101/2021.04.27.441683v1)
