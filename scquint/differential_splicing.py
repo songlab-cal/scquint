@@ -110,6 +110,32 @@ def _run_differential_splicing(
     return df_cluster, df_intron
 
 
+class MultinomialGLM(nn.Module):
+    def __init__(self, n_covariates, n_classes):
+        super(MultinomialGLM, self).__init__()
+        self.A = nn.Parameter(torch.zeros((n_covariates, n_classes-1), dtype=torch.double))
+        self.register_buffer("constant_column", torch.zeros((n_covariates, 1), dtype=torch.double))
+        self.ll = None
+
+    def get_full_A(self):
+        return torch.cat([self.A, self.constant_column], 1)
+
+    def forward(self, X):
+        A = self.get_full_A()
+        logits = X @ A
+        return logits
+
+    def loss_function(self, X, Y):
+        logits = self.forward(X)
+        ll = Multinomial(logits=logits).log_prob(Y).sum()
+        self.ll = ll
+        if torch.isnan(ll):
+            print("A: ", self.A)
+            print("ll: ", ll)
+            raise Exception("debug")
+        return -ll
+
+
 class DirichletMultinomialGLM(nn.Module):
     def __init__(self, n_covariates, n_classes, init_A=None, init_log_alpha=None):
         super(DirichletMultinomialGLM, self).__init__()
@@ -121,9 +147,10 @@ class DirichletMultinomialGLM(nn.Module):
             init_log_alpha = np.ones(1) * 1.0
         self.A = nn.Parameter(torch.tensor(init_A, dtype=torch.double))
         self.log_alpha = nn.Parameter(torch.tensor(init_log_alpha, dtype=torch.double))
-        self.constant_column = torch.zeros((n_covariates, 1), dtype=torch.double)
-        self.conc_shape = torch.tensor(1 + 1e-4, dtype=torch.double)
-        self.conc_rate = torch.tensor(1e-4, dtype=torch.double)
+        self.register_buffer("constant_column", torch.zeros((n_covariates, 1), dtype=torch.double))
+        self.register_buffer("conc_shape", torch.tensor(1 + 1e-4, dtype=torch.double))
+        self.register_buffer("conc_rate", torch.tensor(1e-4, dtype=torch.double))
+        self.register_buffer("P_regularization", torch.full((self.n_classes,), 1.005, dtype=torch.double))
         self.ll = None
 
     def get_full_A(self):
@@ -142,7 +169,7 @@ class DirichletMultinomialGLM(nn.Module):
         res = (
             - ll
             - Gamma(self.conc_shape, self.conc_rate).log_prob(alpha).sum()
-            - Dirichlet(torch.full((self.n_classes,), 1.005, dtype=torch.double)).log_prob(P).sum()
+            - Dirichlet(self.P_regularization).log_prob(P).sum()
         )
         self.ll = ll
         return res
@@ -157,7 +184,7 @@ def fit_model(model_initializer, X, Y, device="cpu"):
     def try_optimization(lr):
         model = model_initializer()
         model.to(device)
-        optimizer = optim.LBFGS(model.parameters(), lr=lr, max_iter=10000)
+        optimizer = optim.LBFGS(model.parameters(), lr=lr, max_iter=10000, line_search_fn="strong_wolfe")
 
         def closure():
             optimizer.zero_grad()
