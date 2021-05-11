@@ -12,7 +12,7 @@ from scipy.special import softmax
 from scipy.stats import chi2
 from statsmodels.stats.multitest import multipletests
 
-from .utils import make_cluster_summation_cpu, relabel, group_normalize, filter_min_cells_per_feature, filter_min_cells_per_cluster
+from .utils import make_cluster_summation_cpu, relabel, group_normalize, filter_min_cells_per_feature, filter_min_cells_per_cluster, recluster, filter_min_global_proportion
 
 
 def lrtest(llmin, llmax, df):
@@ -33,19 +33,29 @@ def _run_differential_splicing(
     min_cells_per_cluster=None,
     min_total_cells_per_intron=None,
     n_jobs=None,
+    do_recluster=False,
+    min_global_proportion=1e-3,
 ):
     n_a = len(cell_idx_a)
     n_b = len(cell_idx_b)
     cell_idx_all = np.concatenate([cell_idx_a, cell_idx_b])
     adata = adata[cell_idx_all].copy()
-    #adata.var["original_cluster"] = adata.var.cluster
     cell_idx_a = np.arange(0, n_a)
     cell_idx_b = np.arange(n_a, n_a + n_b)
+    print(adata.shape)
     if min_total_cells_per_intron is not None:
         adata = filter_min_cells_per_feature(adata, min_total_cells_per_intron)
+        print(adata.shape)
+    if min_global_proportion is not None:
+        adata = filter_min_global_proportion(adata, min_global_proportion)
+        print(adata.shape)
+    if do_recluster:
+        adata = recluster(adata)
+        print(adata.shape)
     if min_cells_per_cluster is not None:
         adata = filter_min_cells_per_cluster(adata, min_cells_per_cluster, cell_idx_a)
         adata = filter_min_cells_per_cluster(adata, min_cells_per_cluster, cell_idx_b)
+        print(adata.shape)
     if adata.shape[1] == 0: return pd.DataFrame(), pd.DataFrame()
     print("Number of intron clusters: ", len(adata.var.cluster.unique()))
     print("Number of introns: ", len(adata.var))
@@ -70,14 +80,15 @@ def _run_differential_splicing(
         init_A_null = np.expand_dims(alr(y.sum(axis=0) + pseudocounts, denominator_idx=-1), axis=0)
         model_null = lambda: DirichletMultinomialGLM(1, n_classes, init_A=init_A_null)
         psi_all = normalize(y.sum(axis=0))
-        psi_a = normalize(y[cell_mask_a].sum(axis=0))
-        psi_b = normalize(y[cell_mask_b].sum(axis=0))
+
         ll_null, model_null = fit_model(model_null, x_null, y)
         init_A = np.zeros((2, n_classes - 1), dtype=float)
         init_A[0] = alr(y[cell_mask_a].sum(axis=0) + pseudocounts, denominator_idx=-1)
         init_A[1] = alr(y[cell_mask_b].sum(axis=0) + pseudocounts, denominator_idx=-1) - init_A[0]
         model = lambda: DirichletMultinomialGLM(2, n_classes, init_A=init_A)
         ll, model = fit_model(model, x, y)
+        if ll+1e-2 < ll_null:
+            raise Exception(f"WARNING: optimization failed for cluster {i}. ll_null={ll_null} ll_full={ll}")
         p_value = lrtest(ll_null, ll, n_classes - 1)
         A = model.get_full_A().cpu().detach().numpy()
         log_alpha = model.log_alpha.cpu().detach().numpy()
@@ -91,8 +102,7 @@ def _run_differential_splicing(
         adata_cluster.var["psi_a"] = psi1
         adata_cluster.var["psi_b"] = psi2
 
-        cluster = adata_cluster.var.original_cluster.iloc[0]
-        adata_cluster.var.loc[:, "cluster"] = cluster
+        cluster = i
         return cluster, p_value, ll_null, ll, n_classes, adata_cluster.var
 
     if n_jobs is not None and n_jobs > 1:
@@ -150,7 +160,6 @@ class DirichletMultinomialGLM(nn.Module):
         self.register_buffer("constant_column", torch.zeros((n_covariates, 1), dtype=torch.double))
         self.register_buffer("conc_shape", torch.tensor(1 + 1e-4, dtype=torch.double))
         self.register_buffer("conc_rate", torch.tensor(1e-4, dtype=torch.double))
-        self.register_buffer("P_regularization", torch.full((self.n_classes,), 1.005, dtype=torch.double))
         self.ll = None
 
     def get_full_A(self):
@@ -169,7 +178,6 @@ class DirichletMultinomialGLM(nn.Module):
         res = (
             - ll
             - Gamma(self.conc_shape, self.conc_rate).log_prob(alpha).sum()
-            - Dirichlet(self.P_regularization).log_prob(P).sum()
         )
         self.ll = ll
         return res

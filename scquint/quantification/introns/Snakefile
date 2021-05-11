@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 from scipy import sparse as sp_sparse
 
-from scquint.utils import filter_min_cells_per_feature, filter_singletons, relabel
+from scquint.utils import filter_min_cells_per_feature, filter_singletons, relabel, recluster
 
 
 min_cells_per_intron = config.get('min_cells_per_intron', 30)
@@ -248,41 +248,6 @@ rule right_introns_intersection_exons:
         "bedtools slop -b 1 -i {input[0]} -g {config[chrom_sizes_path]} | bedtools map -a stdin -b {input[1]} -c 4,4 -o count,distinct | cut -f4-6 | sort -k1n | cut -f2-3 > {output}"
 
 
-def refine_clusters(X, var, filter_singletons=True):
-    chromo = var.chromosome.values
-    A = var.start.values
-    B = var.end.values
-    idx = np.zeros(len(var), dtype=bool)
-    intron_clusters = var.cluster.values.astype(str)
-
-    all_clusters = np.unique(intron_clusters)
-    cluster_counter = Counter(intron_clusters)
-    for c in all_clusters:
-        counts = cluster_counter[c]
-        if filter_singletons and counts < 2: continue
-        G = nx.Graph()
-        nodes = np.where(intron_clusters==c)[0]
-        for node in nodes:
-            G.add_node(node)
-        for n1 in nodes:
-            for n2 in nodes:
-                if n1 < n2:
-                    if A[n1] == A[n2] or B[n1] == B[n2]:
-                        G.add_edge(n1, n2)
-        connected_components = list(nx.connected_components(G))
-        for i, connected_component in enumerate(connected_components):
-            if filter_singletons and len(connected_component) < 2: continue
-            for intron_id in connected_component:
-                idx[intron_id] = True
-                intron_clusters[intron_id] += '_'+ str(i)
-
-    X = X[:,idx]
-    var = var[idx]
-    var.cluster = relabel(intron_clusters[idx])
-    var= var.reset_index(drop=True)
-    return X, var
-
-
 rule build_adata_splicing:
     input:
         "raw_output/X_spl.npz",
@@ -402,8 +367,6 @@ rule build_adata_splicing:
                 accum += len(cluster)
 
             var_spl.cluster = intron_clusters
-        elif wildcards["grouping"] == "transitive":
-            X_spl, var_spl = refine_clusters(X_spl, var_spl, filter_singletons=True)
         elif wildcards["grouping"] == "gene":
             intron_clusters = var_spl.cluster.values
             #var_spl["gene"] = [gl[0] for gl in var_spl.genes.values]
@@ -417,6 +380,8 @@ rule build_adata_splicing:
         print(adata.shape)
         adata = filter_min_cells_per_feature(adata, min_cells_per_intron)
         print(adata.shape)
+        if wildcards["grouping"] == "transitive":
+            adata = recluster(adata)
         adata = filter_singletons(adata)
         print(adata.shape)
         adata.var["original_cluster"] = adata.var.cluster
