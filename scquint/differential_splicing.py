@@ -1,4 +1,5 @@
 import anndata
+from collections import defaultdict
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp_sparse
@@ -23,6 +24,53 @@ def lrtest(llmin, llmax, df):
 
 def normalize(x):
     return x / sum(x)
+
+
+def run_regression(args):
+    cluster, y, cell_idx_a, cell_idx_b = args
+    #var = adata.var.copy()
+    #cluster = var.iloc[0].cluster
+    if cluster % 100 == 0:
+        print("Testing intron cluster ", cluster)
+    #y = adata.X
+    #cells_to_use = np.where(y.sum(axis=1).A1 > 0)[0]
+    cells_to_use = np.where(y.sum(axis=1) > 0)[0]
+    #y = y[cells_to_use].toarray()
+    y = y[cells_to_use]
+    n_cells, n_classes = y.shape
+    n_covariates = 2
+    cell_mask_a = np.isin(cells_to_use, cell_idx_a)
+    cell_mask_b = np.isin(cells_to_use, cell_idx_b)
+    x = np.ones((n_cells, 2), dtype=float)
+    x[cell_mask_a, 1] = 0
+    x_null = np.expand_dims(x[:, 0], axis=1)
+
+    pseudocounts = 10.0
+    init_A_null = np.expand_dims(alr(y.sum(axis=0) + pseudocounts, denominator_idx=-1), axis=0)
+    model_null = lambda: DirichletMultinomialGLM(1, n_classes, init_A=init_A_null)
+
+    ll_null, model_null = fit_model(model_null, x_null, y)
+    init_A = np.zeros((2, n_classes - 1), dtype=float)
+    init_A[0] = alr(y[cell_mask_a].sum(axis=0) + pseudocounts, denominator_idx=-1)
+    init_A[1] = alr(y[cell_mask_b].sum(axis=0) + pseudocounts, denominator_idx=-1) - init_A[0]
+    model = lambda: DirichletMultinomialGLM(2, n_classes, init_A=init_A)
+    ll, model = fit_model(model, x, y)
+    if ll+1e-2 < ll_null:
+        raise Exception(f"WARNING: optimization failed for cluster {cluster}. ll_null={ll_null} ll_full={ll}")
+    p_value = lrtest(ll_null, ll, n_classes - 1)
+    A = model.get_full_A().cpu().detach().numpy()
+    log_alpha = model.log_alpha.cpu().detach().numpy()
+
+    conc = np.exp(log_alpha)
+    beta = A.T
+    psi1 = normalize(conc * softmax(beta[:, 0]))
+    psi2 = normalize(conc * softmax(beta.sum(axis=1)))
+    if np.isnan(p_value): p_value = 1.0
+
+    df_cluster = pd.DataFrame(dict(cluster=[cluster], p_value=[p_value], ll_null=[ll_null], ll=[ll], n_classes=[n_classes]))
+    df_intron = pd.DataFrame(dict(psi_a=psi1, psi_b=psi2))
+
+    return df_cluster, df_intron
 
 
 def _run_differential_splicing(
@@ -57,65 +105,48 @@ def _run_differential_splicing(
         adata = filter_min_cells_per_cluster(adata, min_cells_per_cluster, cell_idx_b)
         print(adata.shape)
     if adata.shape[1] == 0: return pd.DataFrame(), pd.DataFrame()
+
+    adata.var = adata.var.reset_index(drop=True)
     print("Number of intron clusters: ", len(adata.var.cluster.unique()))
     print("Number of introns: ", len(adata.var))
 
+    intron_clusters = adata.var.cluster.values
+    all_intron_clusters = pd.unique(intron_clusters)
+    cluster_introns = defaultdict(list)
+    for i, c in enumerate(intron_clusters):
+        cluster_introns[c].append(i)
 
-    def run_regression(i):
-        if i % 100 == 0:
-            print("Testing intron cluster ", i)
-        adata_cluster = adata[:, adata.var.cluster==i].copy()  # Excessive copying. Else it's giving a lot of warnings
-        cells_to_use = np.where(adata_cluster.X.sum(axis=1).A1 > 0)[0]
-        adata_cluster = adata_cluster[cells_to_use].copy()
-        y = adata_cluster.X.toarray()
-        n_cells, n_classes = y.shape
-        n_covariates = 2
-        cell_mask_a = np.isin(cells_to_use, cell_idx_a)
-        cell_mask_b = np.isin(cells_to_use, cell_idx_b)
-        x = np.ones((n_cells, 2), dtype=float)
-        x[cell_mask_a, 1] = 0
-        x_null = np.expand_dims(x[:, 0], axis=1)
+    #print("subsetting to 2000")
+    #all_intron_clusters = all_intron_clusters[:1000]
 
-        pseudocounts = 10.0
-        init_A_null = np.expand_dims(alr(y.sum(axis=0) + pseudocounts, denominator_idx=-1), axis=0)
-        model_null = lambda: DirichletMultinomialGLM(1, n_classes, init_A=init_A_null)
-        psi_all = normalize(y.sum(axis=0))
-
-        ll_null, model_null = fit_model(model_null, x_null, y)
-        init_A = np.zeros((2, n_classes - 1), dtype=float)
-        init_A[0] = alr(y[cell_mask_a].sum(axis=0) + pseudocounts, denominator_idx=-1)
-        init_A[1] = alr(y[cell_mask_b].sum(axis=0) + pseudocounts, denominator_idx=-1) - init_A[0]
-        model = lambda: DirichletMultinomialGLM(2, n_classes, init_A=init_A)
-        ll, model = fit_model(model, x, y)
-        if ll+1e-2 < ll_null:
-            raise Exception(f"WARNING: optimization failed for cluster {i}. ll_null={ll_null} ll_full={ll}")
-        p_value = lrtest(ll_null, ll, n_classes - 1)
-        A = model.get_full_A().cpu().detach().numpy()
-        log_alpha = model.log_alpha.cpu().detach().numpy()
-
-        conc = np.exp(log_alpha)
-        beta = A.T
-        psi1 = normalize(conc * softmax(beta[:, 0]))
-        psi2 = normalize(conc * softmax(beta.sum(axis=1)))
-        if np.isnan(p_value): p_value = 1.0
-
-        adata_cluster.var["psi_a"] = psi1
-        adata_cluster.var["psi_b"] = psi2
-
-        cluster = i
-        return cluster, p_value, ll_null, ll, n_classes, adata_cluster.var
+    X = adata.X.toarray()  # for easier parallelization using Python's libraries
 
     if n_jobs is not None and n_jobs > 1:
-        tested_clusters, tested_p_values, ll_null, ll, n_classes, tested_vars = zip(
+        dfs_cluster, dfs_intron = zip(
             *Parallel(n_jobs=n_jobs)(
-                delayed(run_regression)(i)
-                for i in adata.var.cluster.unique()
+            #*Parallel(n_jobs=n_jobs, prefer="threads")(
+                delayed(run_regression)((c, X[:, cluster_introns[c]], cell_idx_a, cell_idx_b))
+                for c in all_intron_clusters
             )
         )
+
+        #pool = multiprocessing.Pool(n_jobs)
+        #tested_clusters, tested_p_values, ll_null, ll, n_classes, tested_vars = zip(
+        #    #*pool.map(
+        #    *pool.imap_unordered(
+        #        run_regression,
+        #        #((adata[:, cluster_introns[c]], cell_idx_a, cell_idx_b) for c in all_intron_clusters),
+        #        ((c, X[:, cluster_introns[c]], cell_idx_a, cell_idx_b) for c in all_intron_clusters),
+        #        32,
+        #        #((1, 2, 3) for c in all_intron_clusters),
+        #    )
+        #)
     else:
         tested_clusters, tested_p_values, ll_null, ll, n_classes, tested_vars = zip(*[run_regression(i) for i in adata.var.cluster.unique()])
-    df_cluster = pd.DataFrame(dict(cluster=tested_clusters, p_value=tested_p_values, ll_null=ll_null, ll=ll, n_classes=n_classes))
-    df_intron = pd.concat(tested_vars, ignore_index=True)
+    df_cluster = pd.concat(dfs_cluster, ignore_index=True)
+    df_intron = pd.concat(dfs_intron, ignore_index=True)
+    positions = np.concatenate([cluster_introns[c] for c in all_intron_clusters])
+    df_intron = pd.concat([adata.var.iloc[positions].reset_index(drop=True), df_intron], axis=1)
     print("Done")
     return df_cluster, df_intron
 
@@ -267,3 +298,42 @@ def make_cluster_summation(clusters, device):
         I, V, torch.Size([n_clusters, n_introns])
     )
     return cluster_summation
+
+
+class RegularizedDirichletMultinomialGLM(nn.Module):
+    def __init__(self, n_covariates, n_classes, l1_penalty=0.0, init_A=None, init_log_alpha=None):
+        super(RegularizedDirichletMultinomialGLM, self).__init__()
+        self.n_covariates = n_covariates
+        self.n_classes = n_classes
+        if init_A is None:
+            init_A = np.zeros((n_covariates, n_classes - 1))
+        if init_log_alpha is None:
+            init_log_alpha = np.ones(1) * 1.0
+        self.A = nn.Parameter(torch.tensor(init_A, dtype=torch.double))
+        self.log_alpha = nn.Parameter(torch.tensor(init_log_alpha, dtype=torch.double))
+        self.register_buffer("constant_column", torch.zeros((n_covariates, 1), dtype=torch.double))
+        self.register_buffer("conc_shape", torch.tensor(1 + 1e-4, dtype=torch.double))
+        self.register_buffer("conc_rate", torch.tensor(1e-4, dtype=torch.double))
+        self.l1_penalty = l1_penalty
+        self.ll = None
+
+    def get_full_A(self):
+        return torch.cat([self.A, self.constant_column], 1)
+
+    def forward(self, X):
+        alpha = torch.exp(self.log_alpha)
+        A = self.get_full_A()
+        P = torch.softmax(X @ A, dim=1)
+        concentration = torch.mul(alpha, P)
+        return A, alpha, concentration, P
+
+    def loss_function(self, X, Y):
+        A, alpha, concentration, P = self.forward(X)
+        ll = DirichletMultinomial(concentration).log_prob(Y).sum()
+        res = (
+            - ll
+            - Gamma(self.conc_shape, self.conc_rate).log_prob(alpha).sum()
+            + self.l1_penalty * torch.sum(torch.abs(self.A))
+        )
+        self.ll = ll
+        return res

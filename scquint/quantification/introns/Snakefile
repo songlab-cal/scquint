@@ -28,7 +28,8 @@ print("len(chromosomes): ", len(chromosomes))
 
 rule all:
     input:
-        "output/introns-shared-acceptor/adata.h5ad",
+        #"output/introns-shared-acceptor/adata.h5ad",
+        "output/introns-transitive/adata.h5ad",
 
 
 # this requires name sorted, so it has the mates together
@@ -39,8 +40,9 @@ rule bam2junc:
     output:
         temp('junc_files/{sample_id}.junc'),
     shell:
-        "samtools sort -n -l 0 {input} | samtools view | sjFromSAMcollapseUandM_filter_min_overhang.awk -v minOverhang={min_overhang_all_junctions} | cut -f1-4 | sort -V > {output}"
-        #"samtools sort -n -I 0 {input}| samtools view {input} | sjFromSAMcollapseUandM_filter_min_overhang.awk -v minOverhang={min_overhang_all_junctions} | cut -f1-4 | sort -V > {output}"
+        "samtools view {input} | sjFromSAMcollapseUandM_filter_min_overhang.awk -v minOverhang={min_overhang_all_junctions} | cut -f1-4 | sort -V > {output}"
+        # old "samtools sort -n -l 0 {input} | samtools view | sjFromSAMcollapseUandM_filter_min_overhang.awk -v minOverhang={min_overhang_all_junctions} | cut -f1-4 | sort -V > {output}"
+        # older "samtools sort -n -I 0 {input}| samtools view {input} | sjFromSAMcollapseUandM_filter_min_overhang.awk -v minOverhang={min_overhang_all_junctions} | cut -f1-4 | sort -V > {output}"
 
 
 def find_clusters(introns, chromosome):
@@ -77,7 +79,7 @@ rule chromosome_intron_counts:
         temp('{chromosome}.introns.txt'),
         temp('{chromosome}.X.npz'),
         temp('{chromosome}.intron_clusters.txt')
-    threads: 3
+    #threads: 3
     run:
         # raise Exception('should filter out singletons for the moment')
         print(wildcards.chromosome)
@@ -373,6 +375,8 @@ rule build_adata_splicing:
             for i, gene_id in enumerate(var_spl.gene_id.unique()):
                 intron_clusters[var_spl.gene_id==gene_id] = i
             var_spl.cluster = intron_clusters
+        elif wildcards["grouping"] == "transitive":
+            pass
         else:
             raise Exception(f"Grouping {grouping} not supported.")
 
