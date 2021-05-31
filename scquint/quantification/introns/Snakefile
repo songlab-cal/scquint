@@ -13,8 +13,8 @@ from scquint.utils import filter_min_cells_per_feature, filter_singletons, relab
 
 min_cells_per_intron = config.get('min_cells_per_intron', 30)
 min_intron_length = config.get('min_intron_length', 50)
-max_intron_length = config.get('max_intron_length', 1000000)
-min_overhang_all_junctions = config.get("min_overhang_all_junctions", 6)
+max_intron_length = config.get('max_intron_length', 500000)
+min_overhang_all_junctions = config.get("min_overhang_all_junctions", 8)
 
 
 
@@ -28,7 +28,7 @@ print("len(chromosomes): ", len(chromosomes))
 
 rule all:
     input:
-        #"output/introns-shared-acceptor/adata.h5ad",
+        "output/introns-shared-acceptor/adata.h5ad",
         "output/introns-transitive/adata.h5ad",
 
 
@@ -39,8 +39,14 @@ rule bam2junc:
         lambda wildcards: bam_paths.loc[wildcards.sample_id].bam,
     output:
         temp('junc_files/{sample_id}.junc'),
+        #'junc_files/{sample_id}.junc',
     shell:
-        "samtools view {input} | sjFromSAMcollapseUandM_filter_min_overhang.awk -v minOverhang={min_overhang_all_junctions} | cut -f1-4 | sort -V > {output}"
+        #samtools index {input} &&
+        """
+        regtools junctions extract -s0 -a {min_overhang_all_junctions} -m {min_intron_length} -M {max_intron_length} {input} -o {output}
+        """
+        #regtools junctions extract -s0 -a {min_overhang_all_junctions} -m {min_intron_length} -M {max_intron_length} {input} -o {output}
+        #"samtools view {input} | sjFromSAMcollapseUandM_filter_min_overhang.awk -v minOverhang={min_overhang_all_junctions} | cut -f1-4 | sort -V > {output}"
         # old "samtools sort -n -l 0 {input} | samtools view | sjFromSAMcollapseUandM_filter_min_overhang.awk -v minOverhang={min_overhang_all_junctions} | cut -f1-4 | sort -V > {output}"
         # older "samtools sort -n -I 0 {input}| samtools view {input} | sjFromSAMcollapseUandM_filter_min_overhang.awk -v minOverhang={min_overhang_all_junctions} | cut -f1-4 | sort -V > {output}"
 
@@ -64,7 +70,7 @@ def find_clusters(introns, chromosome):
 
     connected_components = list(nx.connected_components(G))
     for i, connected_component in enumerate(connected_components):
-        # if len(connected_component) < 2: continue
+        if len(connected_component) < 2: continue  # this need to be commented for introns-gene
         for intron_id in connected_component:
             idx[intron_id] = True
             clusters[intron_id] = '{}_{}'.format(chromosome, i)
@@ -79,7 +85,7 @@ rule chromosome_intron_counts:
         temp('{chromosome}.introns.txt'),
         temp('{chromosome}.X.npz'),
         temp('{chromosome}.intron_clusters.txt')
-    #threads: 3
+    threads: 2
     run:
         # raise Exception('should filter out singletons for the moment')
         print(wildcards.chromosome)
@@ -93,14 +99,20 @@ rule chromosome_intron_counts:
             with open(filename) as f:
                 for line in f:
                     #chrom, A, B, dot, counts, strand = line.split()
-                    chrom, A, B, counts = line.split()
+                    #chrom, A, B, counts = line.split()
+                    chrom, A, B, _, counts, _, _, _, _, _, blockSize, _  = line.split()
+
+
                     if chrom != wildcards.chromosome: continue
-                    A, B = int(A), int(B)+1
-                    assert(A < B)
-                    if B-A > int(max_intron_length): continue
-                    # assuming there are no duplicate lines of the same intron
+
+
+                    #A, B = int(A), int(B)+1
+
+                    Aoff, Boff = blockSize.split(",")
+                    A, B = int(A)+int(Aoff)+1, int(B)-int(Boff)+1
+
                     n_cells_per_intron[A,B] += 1
-                    cell_counts[i][A,B] += int(counts)  # or = counts??
+                    cell_counts[i][A,B] += int(counts)
 
         introns = np.array([[intron[0], intron[1]] for (intron,n_cells) in n_cells_per_intron.items()
                             if n_cells >= min_cells_per_intron])
@@ -313,12 +325,8 @@ rule build_adata_splicing:
         print("too long: ", (intron_length > max_intron_length).sum())
         idx1 = (
             (n_cells_per_intron >= min_cells_per_intron) &
-            (intron_length >= min_intron_length) &
-            (intron_length <= max_intron_length) &
-            # (~possible_gene_fusion_artifact) &
             #(var_spl.n_genes_cluster == 1).values
             (var_spl.n_genes == 1).values
-            # & (var_spl.annotated.values)
         )
 
         X_spl = X_spl[:,idx1]
