@@ -1,6 +1,8 @@
 import anndata
 from collections import defaultdict
 import numpy as np
+import optuna
+from optuna.samplers import TPESampler
 import pandas as pd
 import scipy.sparse as sp_sparse
 from skbio.stats.composition import alr
@@ -11,6 +13,7 @@ from joblib import Parallel, delayed
 from pyro.distributions import Dirichlet, DirichletMultinomial, Gamma, Multinomial
 from scipy.special import softmax
 from scipy.stats import chi2
+from sklearn.model_selection import KFold, train_test_split
 from statsmodels.stats.multitest import multipletests
 
 from .utils import make_cluster_summation_cpu, relabel, group_normalize, filter_min_cells_per_feature, filter_min_cells_per_cluster, recluster, filter_min_global_proportion
@@ -333,7 +336,73 @@ class RegularizedDirichletMultinomialGLM(nn.Module):
         res = (
             - ll
             - Gamma(self.conc_shape, self.conc_rate).log_prob(alpha).sum()
-            + self.l1_penalty * torch.sum(torch.abs(self.A))
+            + self.l1_penalty * torch.sum(torch.abs(self.A[1:]))  # excluding the intercept
         )
         self.ll = ll
         return res
+
+
+class LassoMultinomialGLM(nn.Module):
+    def __init__(self, n_covariates, n_classes, l1_penalty):
+        super(LassoMultinomialGLM, self).__init__()
+        self.A = nn.Parameter(torch.zeros((n_covariates, n_classes-1), dtype=torch.double))
+        self.register_buffer("constant_column", torch.zeros((n_covariates, 1), dtype=torch.double))
+        self.ll = None
+        self.l1_penalty = l1_penalty
+
+    def get_full_A(self):
+        return torch.cat([self.A, self.constant_column], 1)
+
+    def forward(self, X):
+        A = self.get_full_A()
+        logits = X @ A
+        return logits
+
+    def loss_function(self, X, Y):
+        logits = self.forward(X)
+        ll = Multinomial(logits=logits).log_prob(Y).sum()
+        res = (
+            - ll
+            + self.l1_penalty * torch.sum(torch.abs(self.A[1:]))  # excluding the intercept
+        )
+        self.ll = ll
+        return res
+
+
+class CVLassoMultinomialGLM:
+    def __init__(self, l1_penalty_min, l1_penalty_max, n_trials):
+        self.l1_penalty_min = l1_penalty_min
+        self.l1_penalty_max = l1_penalty_max
+        self.n_trials = n_trials
+
+    def fit(self, X, Y, device="cpu"):
+        n_covariates = X.shape[1]
+        n_classes = Y.shape[1]
+
+        def objective(trial):
+            l1_penalty = trial.suggest_uniform("l1_penalty", self.l1_penalty_min, self.l1_penalty_max)
+
+            train_ll = []
+            test_ll = []
+            for train_index, test_index in KFold(n_splits=5).split(X):
+                model = lambda: LassoMultinomialGLM(n_covariates, n_classes, l1_penalty)
+                ll, model = fit_model(model, X[train_index], Y[train_index], device=device)
+                train_ll.append(ll)
+                model.loss_function(
+                    torch.tensor(X[test_index], dtype=torch.double, device=device),
+                    torch.tensor(Y[test_index], dtype=torch.double, device=device)
+                )
+                test_ll.append(model.ll.cpu().detach().numpy())
+            return -np.mean(test_ll)
+
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        sampler = TPESampler(seed=42)
+        study = optuna.create_study(sampler=sampler)
+        study.optimize(objective, n_trials=self.n_trials)
+        print("best value: ", study.best_params)
+        l1_penalty = study.best_params["l1_penalty"]
+        self.l1_penalty = l1_penalty
+        model = lambda: LassoMultinomialGLM(n_covariates, n_classes, l1_penalty)
+        ll, model = fit_model(model, X, Y, device=device)
+        self.ll = ll
+        self.model = model
