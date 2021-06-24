@@ -13,7 +13,7 @@ from joblib import Parallel, delayed
 from pyro.distributions import Dirichlet, DirichletMultinomial, Gamma, Multinomial
 from scipy.special import softmax
 from scipy.stats import chi2
-from sklearn.model_selection import KFold, train_test_split
+from sklearn.model_selection import KFold, train_test_split, StratifiedKFold
 from statsmodels.stats.multitest import multipletests
 
 from .utils import make_cluster_summation_cpu, relabel, group_normalize, filter_min_cells_per_feature, filter_min_cells_per_cluster, recluster, filter_min_global_proportion
@@ -303,9 +303,9 @@ def make_cluster_summation(clusters, device):
     return cluster_summation
 
 
-class RegularizedDirichletMultinomialGLM(nn.Module):
-    def __init__(self, n_covariates, n_classes, l1_penalty=0.0, init_A=None, init_log_alpha=None):
-        super(RegularizedDirichletMultinomialGLM, self).__init__()
+class LassoDirichletMultinomialGLM(nn.Module):
+    def __init__(self, n_covariates, n_classes, l1_penalty, init_A=None, init_log_alpha=None):
+        super(LassoDirichletMultinomialGLM, self).__init__()
         self.n_covariates = n_covariates
         self.n_classes = n_classes
         if init_A is None:
@@ -375,16 +375,17 @@ class CVLassoMultinomialGLM:
         self.l1_penalty_max = l1_penalty_max
         self.n_trials = n_trials
 
-    def fit(self, X, Y, device="cpu"):
+        import warnings
+        warnings.filterwarnings('ignore')
+
+    def fit(self, X, Y, stratification, device="cpu"):
         n_covariates = X.shape[1]
         n_classes = Y.shape[1]
 
-        def objective(trial):
-            l1_penalty = trial.suggest_uniform("l1_penalty", self.l1_penalty_min, self.l1_penalty_max)
-
+        def objective(l1_penalty):
             train_ll = []
             test_ll = []
-            for train_index, test_index in KFold(n_splits=5).split(X):
+            for train_index, test_index in StratifiedKFold(n_splits=5, shuffle=True, random_state=42).split(X, stratification):
                 model = lambda: LassoMultinomialGLM(n_covariates, n_classes, l1_penalty)
                 ll, model = fit_model(model, X[train_index], Y[train_index], device=device)
                 train_ll.append(ll)
@@ -395,14 +396,50 @@ class CVLassoMultinomialGLM:
                 test_ll.append(model.ll.cpu().detach().numpy())
             return -np.mean(test_ll)
 
-        optuna.logging.set_verbosity(optuna.logging.WARNING)
-        sampler = TPESampler(seed=42)
-        study = optuna.create_study(sampler=sampler)
-        study.optimize(objective, n_trials=self.n_trials)
-        print("best value: ", study.best_params)
-        l1_penalty = study.best_params["l1_penalty"]
+        l1_penalties = np.linspace(self.l1_penalty_min, self.l1_penalty_max, self.n_trials)
+        losses = list(map(objective, l1_penalties))
+        l1_penalty = l1_penalties[np.argmin(losses)]
+
         self.l1_penalty = l1_penalty
         model = lambda: LassoMultinomialGLM(n_covariates, n_classes, l1_penalty)
+        ll, model = fit_model(model, X, Y, device=device)
+        self.ll = ll
+        self.model = model
+
+
+class CVLassoDirichletMultinomialGLM:
+    def __init__(self, l1_penalty_min, l1_penalty_max, n_trials):
+        self.l1_penalty_min = l1_penalty_min
+        self.l1_penalty_max = l1_penalty_max
+        self.n_trials = n_trials
+
+        import warnings
+        warnings.filterwarnings('ignore')
+
+    def fit(self, X, Y, stratification, device="cpu"):
+        n_covariates = X.shape[1]
+        n_classes = Y.shape[1]
+
+        def objective(l1_penalty):
+            train_ll = []
+            test_ll = []
+            for train_index, test_index in StratifiedKFold(n_splits=5, shuffle=True, random_state=42).split(X, stratification):
+                model = lambda: LassoDirichletMultinomialGLM(n_covariates, n_classes, l1_penalty)
+                ll, model = fit_model(model, X[train_index], Y[train_index], device=device)
+                train_ll.append(ll)
+                model.loss_function(
+                    torch.tensor(X[test_index], dtype=torch.double, device=device),
+                    torch.tensor(Y[test_index], dtype=torch.double, device=device)
+                )
+                test_ll.append(model.ll.cpu().detach().numpy())
+            return -np.mean(test_ll)
+
+        l1_penalties = np.linspace(self.l1_penalty_min, self.l1_penalty_max, self.n_trials)
+        losses = list(map(objective, l1_penalties))
+        l1_penalty = l1_penalties[np.argmin(losses)]
+
+        self.l1_penalty = l1_penalty
+        model = lambda: LassoDirichletMultinomialGLM(n_covariates, n_classes, l1_penalty)
         ll, model = fit_model(model, X, Y, device=device)
         self.ll = ll
         self.model = model
