@@ -12,6 +12,7 @@ install_requires = [
     "statsmodels",
     "scikit-bio>=0.5.5",
     "joblib",
+    "scvi==0.5.0",
 ]
 
 
@@ -23,6 +24,5 @@ setup(name='scquint',
       author_email='gbenegas@berkeley.edu',
       license='MIT',
       packages=['scquint'],
-      scripts=["scripts/sjFromSAMcollapseUandM_filter_min_overhang.awk"],
       zip_safe=False,
       install_requires=install_requires)

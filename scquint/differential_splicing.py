@@ -420,6 +420,7 @@ class CVLassoDirichletMultinomialGLM:
         n_covariates = X.shape[1]
         n_classes = Y.shape[1]
 
+        #def objective(l1_penalty, X, Y, stratification):
         def objective(l1_penalty):
             train_ll = []
             test_ll = []
@@ -436,6 +437,7 @@ class CVLassoDirichletMultinomialGLM:
 
         l1_penalties = np.linspace(self.l1_penalty_min, self.l1_penalty_max, self.n_trials)
         losses = list(map(objective, l1_penalties))
+        #losses =  Parallel(n_jobs=32)(delayed(objective)(l1_penalty, X, Y, stratification) for l1_penalty in l1_penalties)
         l1_penalty = l1_penalties[np.argmin(losses)]
 
         self.l1_penalty = l1_penalty
