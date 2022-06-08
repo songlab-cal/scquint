@@ -29,7 +29,9 @@ Our read mapping workflow, using [STAR](https://github.com/alexdobin/STAR), is d
 Precomputed AnnData objects are available at https://github.com/songlab-cal/scquint-analysis.
 
 ## Differential splicing
-See `differential_splicing_example.ipynb`.
+See `differential_splicing_example.ipynb` <a target="_blank" href="https://colab.research.google.com/github/songlab-cal/scquint/blob/main/differential_splicing_example.ipynb">
+  <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/>
+</a>
 
 ## Citation
 Benegas, G., Fischer, J., Song., Y.S. Robust and annotation-free analysis of alternative splicing across diverse cell types in mice. eLife 2022;11:e73520  
