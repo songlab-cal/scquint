@@ -25,7 +25,7 @@ setup(
     author='Gonzalo Benegas',
     author_email='gbenegas@berkeley.edu',
     license='MIT',
-    packages=['scquint'],
+    packages=['scquint', 'scquint.quantification', 'scquint.dimensionality_reduction'],
     zip_safe=False,
     install_requires=install_requires,
     extras_require = {
