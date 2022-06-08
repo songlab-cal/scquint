@@ -1,6 +1,5 @@
-from collections import Counter, defaultdict
-
 import anndata
+from collections import Counter, defaultdict
 import networkx as nx
 import numpy as np
 import pandas as pd
@@ -28,7 +27,6 @@ def relabel(labels):
 
 
 def group_normalize(X, groups, smooth=False):
-    print("assuming np.array for the moment")
     cluster_summation = make_cluster_summation_cpu(groups)
     if smooth:
         intron_sum = X.sum(axis=0)
@@ -87,7 +85,7 @@ def recluster(adata):
     print("recluster")
     A = adata.var.start.values
     B = adata.var.end.values
-    intron_clusters = adata.var.cluster.values.astype(str)
+    intron_clusters = adata.var.cluster.values.astype(object)
 
     mask = np.zeros(len(adata.var), dtype=bool)
 
@@ -115,11 +113,10 @@ def recluster(adata):
             if len(connected_component) < 2: continue
             for intron_id in connected_component:
                 mask[intron_id] = True
-                intron_clusters[intron_id] += '_'+ str(i)
+                intron_clusters[intron_id] = str(intron_clusters[intron_id]) + '_'+ str(i)
 
     adata = adata[:, mask]
     adata.var.cluster = relabel(intron_clusters[mask])
-    adata.var = adata.var.reset_index(drop=True)
 
     return adata
 

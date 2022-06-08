@@ -7,6 +7,7 @@ from scquint.utils import filter_min_cells_per_feature, filter_singletons, relab
 
 
 bam_paths = pd.read_csv(config["bam_paths"], "\t", index_col=0, header=None, names=["bam"])
+bam_paths.index = bam_paths.index.astype(str)
 print(bam_paths)
 sample_ids = bam_paths.index.values
 

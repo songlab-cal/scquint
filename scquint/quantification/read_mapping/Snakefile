@@ -5,11 +5,14 @@ import pandas as pd
 
 
 fastq_paths = pd.read_csv(config['fastq_paths'], "\t", header=None, index_col=0, names=["fastq_1", "fastq_2"])
-print(fastq_paths)
+
+#fastq_paths = fastq_paths.sample(frac=1, random_state=43)
+
 sample_ids = fastq_paths.index.values
 print(sample_ids.shape)
 #sample_ids = sample_ids[int(config["turn"])::int(config["every"])]
 #print(sample_ids.shape)
+#print(sample_ids)
 
 n_splits = int(np.cbrt(len(sample_ids)))
 splits = np.arange(n_splits)
@@ -27,8 +30,8 @@ rule all:
     input:
         #expand('mapping_second_pass/{sample_id}/Aligned.sortedByCoord.out.bam', sample_id=sample_ids)
         #"second_STAR_index",
-        #expand('mapping_first_pass/{sample_id}/SJ.out.tab', sample_id=sample_ids),
-        expand("mapping_second_pass/{sample_id}/Aligned.rmdup.out.bam", sample_id=sample_ids),
+        expand("rmdup/{sample_id}/Aligned.rmdup.out.bam", sample_id=sample_ids),
+        #expand('mapping_first_pass/{sample_id}/SJ.out.tab', sample_id=sample_ids)
 
 
 rule make_first_STAR_index:
@@ -137,11 +140,11 @@ rule map_second_pass:
         lambda wildcards: fastq_paths.loc[wildcards.sample_id].fastq_2,
         "second_index_loaded.flag"
     output:
-        temp('mapping_second_pass/{sample_id}/Aligned.sortedByCoord.out.bam')
+        temp('mapping_second_pass/{sample_id}/Aligned.sortedByCoord.out.bam'),
     priority: 100
     threads: 1
     shell: """
-    STAR --genomeDir second_STAR_index --genomeLoad LoadAndKeep --readFilesIn {input[0]} {input[1]} --readFilesCommand {read_files_command} --limitBAMsortRAM 8000000000 --outFileNamePrefix mapping_second_pass/{wildcards.sample_id}/ --runThreadN {threads} --outSJfilterReads Unique --outSAMtype BAM SortedByCoordinate --outSAMstrandField intronMotif --outFilterMultimapNmax 1 --outFilterType BySJout --seedSearchStartLmax {seedSearchStartLmax} --outSJfilterOverhangMin {min_overhang_unannotated_non_canonical} {min_overhang_unannotated_canonical} {min_overhang_unannotated_canonical} {min_overhang_unannotated_canonical} --alignEndsType EndToEnd
+    STAR --genomeDir second_STAR_index --genomeLoad LoadAndKeep --readFilesIn {input[0]} {input[1]} --readFilesCommand {read_files_command} --limitBAMsortRAM 4000000000 --outFileNamePrefix mapping_second_pass/{wildcards.sample_id}/ --runThreadN {threads} --outSJfilterReads Unique --outSAMtype BAM SortedByCoordinate --outSAMstrandField intronMotif --outFilterMultimapNmax 1 --outFilterType BySJout --seedSearchStartLmax {seedSearchStartLmax} --outSJfilterOverhangMin {min_overhang_unannotated_non_canonical} {min_overhang_unannotated_canonical} {min_overhang_unannotated_canonical} {min_overhang_unannotated_canonical} --alignEndsType EndToEnd
     """
 
 
@@ -159,9 +162,10 @@ rule mark_duplicates_and_multimappers:
         "mapping_second_pass/{sample_id}/Aligned.sortedByCoord.out.bam",
         "second_index_unloaded.flag"
     output:
-        temp("mapping_second_pass/{sample_id}/Processed.out.bam")
+        temp("processed/{sample_id}/Processed.out.bam")
+    #threads: workflow.cores
     shell:
-        "STAR --runMode inputAlignmentsFromBAM --inputBAMfile {input[0]} --bamRemoveDuplicatesType UniqueIdentical --outFileNamePrefix mapping_second_pass/{wildcards.sample_id}/"
+        "STAR --runMode inputAlignmentsFromBAM --inputBAMfile {input[0]} --bamRemoveDuplicatesType UniqueIdentical --outFileNamePrefix processed/{wildcards.sample_id}/"
 
 
 # -F 512 keeps only QC-pass
@@ -169,9 +173,8 @@ rule mark_duplicates_and_multimappers:
 
 rule filter_bam:
     input:
-        "mapping_second_pass/{sample_id}/Processed.out.bam"
+        "processed/{sample_id}/Processed.out.bam"
     output:
-        protected("mapping_second_pass/{sample_id}/Aligned.rmdup.out.bam")
+        protected("rmdup/{sample_id}/Aligned.rmdup.out.bam")
     shell:
         "samtools view -F 512 -u {input} | samtools view -F 0x400 -o {output}"
-        #"samtools view -F 512 -u {input} | samtools view -F 0x400 -u | samtools sort -n -O BAM -o {output}"

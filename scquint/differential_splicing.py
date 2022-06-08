@@ -1,11 +1,8 @@
 import anndata
 from collections import defaultdict
 import numpy as np
-import optuna
-from optuna.samplers import TPESampler
 import pandas as pd
 import scipy.sparse as sp_sparse
-from skbio.stats.composition import alr
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -17,6 +14,103 @@ from sklearn.model_selection import KFold, train_test_split, StratifiedKFold
 from statsmodels.stats.multitest import multipletests
 
 from .utils import make_cluster_summation_cpu, relabel, group_normalize, filter_min_cells_per_feature, filter_min_cells_per_cluster, recluster, filter_min_global_proportion
+
+
+# original: from skbio.stats.composition import closure
+def closure(mat):
+    """
+    Performs closure to ensure that all elements add up to 1.
+    Parameters
+    ----------
+    mat : array_like
+       a matrix of proportions where
+       rows = compositions
+       columns = components
+    Returns
+    -------
+    array_like, np.float64
+       A matrix of proportions where all of the values
+       are nonzero and each composition (row) adds up to 1
+    Raises
+    ------
+    ValueError
+       Raises an error if any values are negative.
+    ValueError
+       Raises an error if the matrix has more than 2 dimension.
+    ValueError
+       Raises an error if there is a row that has all zeros.
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from skbio.stats.composition import closure
+    >>> X = np.array([[2, 2, 6], [4, 4, 2]])
+    >>> closure(X)
+    array([[ 0.2,  0.2,  0.6],
+           [ 0.4,  0.4,  0.2]])
+    """
+    mat = np.atleast_2d(mat)
+    if np.any(mat < 0):
+        raise ValueError("Cannot have negative proportions")
+    if mat.ndim > 2:
+        raise ValueError("Input matrix can only have two dimensions or less")
+    if np.all(mat == 0, axis=1).sum() > 0:
+        raise ValueError("Input matrix cannot have rows with all zeros")
+    mat = mat / mat.sum(axis=1, keepdims=True)
+    return mat.squeeze()
+
+
+# original function: from skbio.stats.composition import alr
+def alr(mat, denominator_idx=0):
+    r"""
+    Performs additive log ratio transformation.
+    This function transforms compositions from a D-part Aitchison simplex to
+    a non-isometric real space of D-1 dimensions. The argument
+    `denominator_col` defines the index of the column used as the common
+    denominator. The :math: `alr` transformed data are amenable to multivariate
+    analysis as long as statistics don't involve distances.
+    :math:`alr: S^D \rightarrow \mathbb{R}^{D-1}`
+    The alr transformation is defined as follows
+    .. math::
+        alr(x) = \left[ \ln \frac{x_1}{x_D}, \ldots,
+        \ln \frac{x_{D-1}}{x_D} \right]
+    where :math:`D` is the index of the part used as common denominator.
+    Parameters
+    ----------
+    mat: numpy.ndarray
+       a matrix of proportions where
+       rows = compositions and
+       columns = components
+    denominator_idx: int
+       the index of the column (2D-matrix) or position (vector) of
+       `mat` which should be used as the reference composition. By default
+       `denominator_idx=0` to specify the first column or position.
+    Returns
+    -------
+    numpy.ndarray
+         alr-transformed data projected in a non-isometric real space
+         of D-1 dimensions for a D-parts composition
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from skbio.stats.composition import alr
+    >>> x = np.array([.1, .3, .4, .2])
+    >>> alr(x)
+    array([ 1.09861229,  1.38629436,  0.69314718])
+    """
+    mat = closure(mat)
+    if mat.ndim == 2:
+        mat_t = mat.T
+        numerator_idx = list(range(0, mat_t.shape[0]))
+        del numerator_idx[denominator_idx]
+        lr = np.log(mat_t[numerator_idx, :]/mat_t[denominator_idx, :]).T
+    elif mat.ndim == 1:
+        numerator_idx = list(range(0, mat.shape[0]))
+        del numerator_idx[denominator_idx]
+        lr = np.log(mat[numerator_idx]/mat[denominator_idx])
+    else:
+        raise ValueError("mat must be either 1D or 2D")
+    return lr
+
 
 
 def lrtest(llmin, llmax, df):
@@ -31,14 +125,9 @@ def normalize(x):
 
 def run_regression(args):
     cluster, y, cell_idx_a, cell_idx_b = args
-    #var = adata.var.copy()
-    #cluster = var.iloc[0].cluster
     if cluster % 100 == 0:
         print("Testing intron cluster ", cluster)
-    #y = adata.X
-    #cells_to_use = np.where(y.sum(axis=1).A1 > 0)[0]
     cells_to_use = np.where(y.sum(axis=1) > 0)[0]
-    #y = y[cells_to_use].toarray()
     y = y[cells_to_use]
     n_cells, n_classes = y.shape
     n_covariates = 2
@@ -127,25 +216,15 @@ def _run_differential_splicing(
     if n_jobs is not None and n_jobs > 1:
         dfs_cluster, dfs_intron = zip(
             *Parallel(n_jobs=n_jobs)(
-            #*Parallel(n_jobs=n_jobs, prefer="threads")(
                 delayed(run_regression)((c, X[:, cluster_introns[c]], cell_idx_a, cell_idx_b))
                 for c in all_intron_clusters
             )
         )
-
-        #pool = multiprocessing.Pool(n_jobs)
-        #tested_clusters, tested_p_values, ll_null, ll, n_classes, tested_vars = zip(
-        #    #*pool.map(
-        #    *pool.imap_unordered(
-        #        run_regression,
-        #        #((adata[:, cluster_introns[c]], cell_idx_a, cell_idx_b) for c in all_intron_clusters),
-        #        ((c, X[:, cluster_introns[c]], cell_idx_a, cell_idx_b) for c in all_intron_clusters),
-        #        32,
-        #        #((1, 2, 3) for c in all_intron_clusters),
-        #    )
-        #)
     else:
-        tested_clusters, tested_p_values, ll_null, ll, n_classes, tested_vars = zip(*[run_regression(i) for i in adata.var.cluster.unique()])
+        dfs_cluster, dfs_intron = zip(*[
+            run_regression((c, X[:, cluster_introns[c]], cell_idx_a, cell_idx_b))
+            for c in all_intron_clusters
+        ])
     df_cluster = pd.concat(dfs_cluster, ignore_index=True)
     df_intron = pd.concat(dfs_intron, ignore_index=True)
     positions = np.concatenate([cluster_introns[c] for c in all_intron_clusters])
@@ -208,7 +287,7 @@ class DirichletMultinomialGLM(nn.Module):
 
     def loss_function(self, X, Y):
         A, alpha, concentration, P = self.forward(X)
-        ll = DirichletMultinomial(concentration).log_prob(Y).sum()
+        ll = DirichletMultinomial(concentration, validate_args=False).log_prob(Y).sum()
         res = (
             - ll
             - Gamma(self.conc_shape, self.conc_rate).log_prob(alpha).sum()
@@ -275,7 +354,9 @@ def run_differential_splicing(
     df_intron["abs_delta_psi"] = df_intron.delta_psi.abs()
     df_intron["abs_lfc_psi"] = df_intron.lfc_psi.abs()
 
-    groupby = df_intron.groupby("cluster").agg({"gene_id": "first", "abs_delta_psi": "max", "abs_lfc_psi": "max"})
+    if "gene_name" not in df_intron.columns:
+        df_intron["gene_name"] = "NA"
+    groupby = df_intron.groupby("cluster").agg({"gene_id": "first", "gene_name": "first", "abs_delta_psi": "max", "abs_lfc_psi": "max"})
     groupby = groupby.rename(columns={"abs_delta_psi": "max_abs_delta_psi", "abs_lfc_psi": "max_abs_lfc_psi"})
     df_cluster = df_cluster.set_index("cluster").merge(groupby, left_index=True, right_index=True, how="inner")
     df_cluster = df_cluster.sort_values(by="p_value")
@@ -416,12 +497,11 @@ class CVLassoDirichletMultinomialGLM:
         import warnings
         warnings.filterwarnings('ignore')
 
-    def fit(self, X, Y, stratification, device="cpu"):
+    def fit(self, X, Y, stratification, device="cpu", threads=1):
         n_covariates = X.shape[1]
         n_classes = Y.shape[1]
 
-        #def objective(l1_penalty, X, Y, stratification):
-        def objective(l1_penalty):
+        def objective(l1_penalty, X, Y, stratification):
             train_ll = []
             test_ll = []
             for train_index, test_index in StratifiedKFold(n_splits=5, shuffle=True, random_state=42).split(X, stratification):
@@ -436,9 +516,9 @@ class CVLassoDirichletMultinomialGLM:
             return -np.mean(test_ll)
 
         l1_penalties = np.linspace(self.l1_penalty_min, self.l1_penalty_max, self.n_trials)
-        losses = list(map(objective, l1_penalties))
-        #losses =  Parallel(n_jobs=32)(delayed(objective)(l1_penalty, X, Y, stratification) for l1_penalty in l1_penalties)
-        l1_penalty = l1_penalties[np.argmin(losses)]
+        losses =  Parallel(n_jobs=threads)(delayed(objective)(l1_penalty, X, Y, stratification) for l1_penalty in l1_penalties)
+        print("losses: ", losses)
+        l1_penalty = l1_penalties[np.nanargmin(losses)]
 
         self.l1_penalty = l1_penalty
         model = lambda: LassoDirichletMultinomialGLM(n_covariates, n_classes, l1_penalty)
