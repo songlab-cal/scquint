@@ -2,9 +2,11 @@
 
 ## Installation
 ```
-git clone https://github.com/songlab-cal/scquint.git
-cd scquint
-pip install .
+pip install git+https://github.com/songlab-cal/scquint.git
+```
+If you need the VAE, do a full installation (with more complex dependencies):
+```
+pip install "scquint[vae] @ git+https://github.com/songlab-cal/scquint.git"
 ```
 Read mapping and intron quantification also require STAR, samtools and bedtools. An easy way to install is via conda:
 
