@@ -20,13 +20,13 @@ install_requires = [
 
 setup(
     name='scquint',
-    version='0.3',
+    version='0.3.1',
     description='scQuint',
     url='http://github.com/songlab-cal/scquint',
     author='Gonzalo Benegas',
     author_email='gbenegas@berkeley.edu',
     license='MIT',
-    packages=['scquint', 'scquint.quantification', 'scquint.dimensionality_reduction'],
+    packages=['scquint', 'scquint.dimensionality_reduction'],
     zip_safe=False,
     install_requires=install_requires,
     extras_require = {
