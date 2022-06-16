@@ -21,6 +21,8 @@ from scvi.models.utils import one_hot
 from torch.distributions import Dirichlet, Laplace, Multinomial, Normal
 from torch.distributions import kl_divergence as kl
 
+from ..data import relabel
+
 
 class Dataset(GeneExpressionDataset):
     def __init__(self, adata):
@@ -31,9 +33,10 @@ class Dataset(GeneExpressionDataset):
         self.n_cells = len(self.obs)
         print("n_cells: ", self.n_cells)
         self.n_introns = len(self.var)
-        self.n_clusters = int(self.var.cluster.max() + 1)
-        self.intron_clusters = self.var.cluster.values.astype(int)
-        print("n_clusters: ", self.n_clusters)
+        self.var.intron_group = relabel(self.var.intron_group)
+        self.n_intron_groups = int(self.var.intron_group.max() + 1)
+        self.intron_groups = self.var.intron_group.values.astype(int)
+        print("n_intron_groups: ", self.n_intron_groups)
         X = adata.X
 
         # batch_indices = None
@@ -117,8 +120,8 @@ class LinearEncoder(nn.Module):
 class IntronsDecoder(nn.Module):
     def __init__(
         self,
-        intron_clusters,
-        cluster_summation,
+        intron_groups,
+        intron_group_summation,
         n_input: int,
         n_output: int,
         n_cat_list: Iterable[int] = None,
@@ -126,8 +129,8 @@ class IntronsDecoder(nn.Module):
         n_hidden: int = 128,
     ):
         super().__init__()
-        self.intron_clusters = intron_clusters
-        self.cluster_summation = cluster_summation
+        self.intron_groups = intron_groups
+        self.intron_group_summation = intron_group_summation
 
         self.first_part = FCLayers(
             n_in=n_input,
@@ -143,19 +146,19 @@ class IntronsDecoder(nn.Module):
         potentials = self.second_part(self.first_part(z))
         potentials[:, first_indices] = 0.0
         p_u = torch.exp(potentials)
-        cluster_sums = torch.sparse.mm(self.cluster_summation, p_u.T).T
-        norm_factor = cluster_sums[:, self.intron_clusters]
+        intron_group_sums = torch.sparse.mm(self.intron_group_summation, p_u.T).T
+        norm_factor = intron_group_sums[:, self.intron_groups]
         p = torch.div(p_u, norm_factor)
         return p
 
 
 class LinearIntronsDecoder(nn.Module):
     def __init__(
-        self, intron_clusters, cluster_summation, n_input: int, n_output: int, bias=True
+        self, intron_groups, intron_group_summation, n_input: int, n_output: int, bias=True
     ):
         super().__init__()
-        self.intron_clusters = intron_clusters
-        self.cluster_summation = cluster_summation
+        self.intron_groups = intron_groups
+        self.intron_group_summation = intron_group_summation
 
         self.first_part = nn.Linear(n_input, n_output, bias=bias)
 
@@ -163,8 +166,8 @@ class LinearIntronsDecoder(nn.Module):
         potentials = self.first_part(z)
         potentials[:, first_indices] = 0.0
         p_u = torch.exp(potentials)
-        cluster_sums = torch.sparse.mm(self.cluster_summation, p_u.T).T
-        norm_factor = cluster_sums[:, self.intron_clusters]
+        intron_group_sums = torch.sparse.mm(self.intron_group_summation, p_u.T).T
+        norm_factor = intron_group_sums[:, self.intron_groups]
         p = torch.div(p_u, norm_factor)
         return p
 
@@ -174,8 +177,8 @@ class VAE(nn.Module):
         self,
         n_genes: int,
         n_introns: int,
-        n_clusters: int,
-        intron_clusters: [int],
+        n_intron_groups: int,
+        intron_groups: [int],
         n_batch: int = 0,
         n_hidden: int = 128,
         n_latent: int = 10,
@@ -192,7 +195,7 @@ class VAE(nn.Module):
         feature_addition=None,
         regularization_gaussian_std=None,
         regularization_laplace_std=None,
-        concentration_shape="cluster",
+        concentration_shape="intron_group",
     ):
         super().__init__()
         self.log_variational = False
@@ -200,7 +203,7 @@ class VAE(nn.Module):
         self.n_batch = n_batch
         self.n_genes = n_genes
         self.n_introns = n_introns
-        self.n_clusters = n_clusters
+        self.n_intron_groups = n_intron_groups
         self.use_cuda = use_cuda
         self.device = "cuda:0" if self.use_cuda else "cpu"
         print("self.device: ", self.device)
@@ -213,17 +216,17 @@ class VAE(nn.Module):
         self.regularization_laplace_std = regularization_laplace_std
         self.concentration_shape = concentration_shape
 
-        all_intron_clusters = np.unique(intron_clusters)
+        all_intron_groups = np.unique(intron_groups)
         first_indices_dict = {}
         not_first_indices = []
-        for i, c in enumerate(intron_clusters):
+        for i, c in enumerate(intron_groups):
             if c not in first_indices_dict:
                 first_indices_dict[c] = i
             else:
                 not_first_indices.append(i)
-        first_indices = np.array([first_indices_dict[c] for c in all_intron_clusters])
+        first_indices = np.array([first_indices_dict[c] for c in all_intron_groups])
         not_first_indices = np.array(not_first_indices)
-        print(len(intron_clusters), len(first_indices), len(not_first_indices), len(first_indices)+len(not_first_indices))
+        print(len(intron_groups), len(first_indices), len(not_first_indices), len(first_indices)+len(not_first_indices))
 
         n_cat_list = [n_batch]
 
@@ -244,7 +247,7 @@ class VAE(nn.Module):
                 n_hidden=n_hidden,
             )
 
-        input_dimension = n_genes + n_introns - n_clusters if input_transform == "frequency-smoothed" else n_genes + n_introns
+        input_dimension = n_genes + n_introns - n_intron_groups if input_transform == "frequency-smoothed" else n_genes + n_introns
         if linearly_encoded:
             self.z_encoder = LinearEncoder(input_dimension, n_latent)
         else:
@@ -264,16 +267,16 @@ class VAE(nn.Module):
                 not_first_indices, dtype=torch.long, device=self.device
             )
 
-            self.intron_clusters = torch.tensor(
-                intron_clusters, dtype=torch.long, device=self.device
+            self.intron_groups = torch.tensor(
+                intron_groups, dtype=torch.long, device=self.device
             )
-            cols, rows = zip(*list(enumerate(intron_clusters)))
-            vals = np.ones(len(intron_clusters), dtype=int)
+            cols, rows = zip(*list(enumerate(intron_groups)))
+            vals = np.ones(len(intron_groups), dtype=int)
 
             I = torch.tensor([rows, cols], device=self.device, dtype=torch.long)
             V = torch.tensor(vals, device=self.device, dtype=torch.float)
-            self.cluster_summation = torch.sparse.FloatTensor(
-                I, V, torch.Size([self.n_clusters, self.n_introns])
+            self.intron_group_summation = torch.sparse.FloatTensor(
+                I, V, torch.Size([self.n_intron_groups, self.n_introns])
             )
 
             # intron_sums = np.ones_like(intron_sums)
@@ -286,33 +289,33 @@ class VAE(nn.Module):
                 )
 
             if self.use_cuda:
-                self.cluster_summation = self.cluster_summation.cuda()
+                self.intron_group_summation = self.intron_group_summation.cuda()
 
-            # cluster_sums = (torch.sparse.mm(self.cluster_summation, self.intron_sums.reshape(n_introns, 1))).reshape(n_clusters)[self.intron_clusters]
+            # intron_group_sums = (torch.sparse.mm(self.intron_group_summation, self.intron_sums.reshape(n_introns, 1))).reshape(n_intron_groups)[self.intron_groups]
 
-            # self.mean_factors = torch.log(self.intron_sums+cluster_sums) - torch.log(cluster_sums)
+            # self.mean_factors = torch.log(self.intron_sums+intron_group_sums) - torch.log(intron_group_sums)
 
-            # self.mean_factors = [np.log(1+1.0/(intron_clusters==c).sum()) for c in intron_clusters]
+            # self.mean_factors = [np.log(1+1.0/(intron_groups==c).sum()) for c in intron_groups]
             # self.mean_factors = torch.tensor(self.mean_factors, dtype=torch.float)
 
             # print(self.mean_factors[:3])
             # raise Exception('debug')
 
-            # foo = [1.0/(intron_clusters==c).sum() for c in intron_clusters]
+            # foo = [1.0/(intron_groups==c).sum() for c in intron_groups]
             # self.foo = torch.tensor(foo, dtype=torch.float).cuda()
 
             if linearly_decoded:
                 self.introns_decoder = LinearIntronsDecoder(
-                    self.intron_clusters,
-                    self.cluster_summation,
+                    self.intron_groups,
+                    self.intron_group_summation,
                     n_latent,
                     n_introns,
                     bias=True,
                 )
             else:
                 self.introns_decoder = IntronsDecoder(
-                    self.intron_clusters,
-                    self.cluster_summation,
+                    self.intron_groups,
+                    self.intron_group_summation,
                     n_input=n_latent,
                     n_output=n_introns,
                     n_layers=n_layers,
@@ -323,8 +326,8 @@ class VAE(nn.Module):
             if loss_introns == "dirichlet-multinomial":
                 if self.concentration_shape == "intron":
                     self.feature_precision = torch.nn.Parameter(torch.randn(n_introns))
-                elif self.concentration_shape == "cluster":
-                    self.feature_precision = torch.nn.Parameter(torch.randn(n_clusters))
+                elif self.concentration_shape == "intron_group":
+                    self.feature_precision = torch.nn.Parameter(torch.randn(n_intron_groups))
 
     def reconstruction_loss_genes(self, x, px_rate, px_r, px_dropout):
         if self.loss_genes == "zinb":
@@ -342,9 +345,9 @@ class VAE(nn.Module):
                 return -self.dirichlet_multinomial_log_likelihood(
                     x, p, torch.exp(self.feature_precision)
                 )
-            elif self.concentration_shape == "cluster":
+            elif self.concentration_shape == "intron_group":
                 return -self.dirichlet_multinomial_log_likelihood(
-                    x, p, torch.exp(self.feature_precision)[self.intron_clusters]
+                    x, p, torch.exp(self.feature_precision)[self.intron_groups]
                 )
         else:
             raise Exception("reconstruction loss not implemented")
@@ -434,25 +437,25 @@ class VAE(nn.Module):
         loadings[self.first_indices] = 0.0
         print(loadings.shape)
         if center_around_zero:
-            cluster_counter = collections.Counter(
-                [int(x) for x in self.intron_clusters]
+            intron_group_counter = collections.Counter(
+                [int(x) for x in self.intron_groups]
             )
-            cluster_sizes = torch.tensor(
-                [cluster_counter[c] for c in range(self.n_clusters)],
+            intron_group_sizes = torch.tensor(
+                [intron_group_counter[c] for c in range(self.n_intron_groups)],
                 dtype=torch.float,
                 device=self.device,
             )
-            print(cluster_sizes.shape)
-            print(cluster_sizes[:10])
-            # intron_cluster_sizes = cluster_sizes[self.intron_clusters]
-            cluster_sums = torch.sparse.mm(self.cluster_summation, loadings)
-            print(cluster_sums.shape)
-            print(cluster_sums.T[0, :10])
-            cluster_means = torch.div(cluster_sums.T, cluster_sizes).T
-            print(cluster_means.shape)
-            intron_cluster_means = cluster_means[self.intron_clusters]
-            print(intron_cluster_means.shape)
-            loadings -= intron_cluster_means
+            print(intron_group_sizes.shape)
+            print(intron_group_sizes[:10])
+            # intron_group_sizes = intron_group_sizes[self.intron_groups]
+            intron_group_sums = torch.sparse.mm(self.intron_group_summation, loadings)
+            print(intron_group_sums.shape)
+            print(intron_group_sums.T[0, :10])
+            intron_group_means = torch.div(intron_group_sums.T, intron_group_sizes).T
+            print(intron_group_means.shape)
+            intron_group_means = intron_group_means[self.intron_groups]
+            print(intron_group_means.shape)
+            loadings -= intron_group_means
         return loadings.T.cpu().detach().numpy()
 
     # def scale_from_z(self, sample_batch, fixed_batch):
@@ -471,9 +474,9 @@ class VAE(nn.Module):
         log_factorial_xs = torch.lgamma(x + 1).sum(-1)
         # print("log_factorial_xs.shape", log_factorial_xs.shape)
 
-        x_cluster_sums = torch.sparse.mm(self.cluster_summation, x.T).T
-        # print("x_cluster_sums.shape", x_cluster_sums.shape)
-        log_factorial_n = torch.lgamma(x_cluster_sums + 1).sum(-1)
+        x_intron_group_sums = torch.sparse.mm(self.intron_group_summation, x.T).T
+        # print("x_intron_group_sums.shape", x_intron_group_sums.shape)
+        log_factorial_n = torch.lgamma(x_intron_group_sums + 1).sum(-1)
         # print("log_factorial_n.shape", log_factorial_n.shape)
 
         return log_factorial_n - log_factorial_xs + log_powers
@@ -484,8 +487,8 @@ class VAE(nn.Module):
         alpha = p * feature_precision
         # print("alpha.shape", alpha.shape)
 
-        x_sum = torch.sparse.mm(self.cluster_summation, x.T).T
-        alpha_sum = torch.sparse.mm(self.cluster_summation, alpha.T).T
+        x_sum = torch.sparse.mm(self.intron_group_summation, x.T).T
+        alpha_sum = torch.sparse.mm(self.intron_group_summation, alpha.T).T
 
         t1 = _log_beta_1(alpha_sum, x_sum, True).sum(dim=1)
         t2 = _log_beta_1(alpha, x, True).sum(dim=1)
@@ -498,8 +501,8 @@ class VAE(nn.Module):
             return torch.log(1 + x)
         elif self.input_transform == "frequency-smoothed":
             x2 = x + self.feature_addition
-            cluster_sums = torch.sparse.mm(self.cluster_summation, x2.T).T
-            norm_factor = cluster_sums[:, self.intron_clusters]
+            intron_group_sums = torch.sparse.mm(self.intron_group_summation, x2.T).T
+            norm_factor = intron_group_sums[:, self.intron_groups]
             x2 = torch.div(x2, norm_factor)
             return x2[:, self.not_first_indices]
         else:
@@ -813,8 +816,8 @@ def run_vae(
         lr_factor= 0.5,
        )
 
-    vae = VAE(dataset.n_genes, dataset.n_introns, dataset.n_clusters,
-              dataset.intron_clusters, n_latent=n_latent, n_layers=n_layers,
+    vae = VAE(dataset.n_genes, dataset.n_introns, dataset.n_intron_groups,
+              dataset.intron_groups, n_latent=n_latent, n_layers=n_layers,
               n_hidden=n_hidden, dropout_rate=dropout_rate, use_cuda=use_cuda,
               loss_introns=loss_introns, linearly_decoded=linearity=='linear',
               input_transform=input_transform, feature_addition=feature_addition,

@@ -2,18 +2,19 @@ import anndata
 from collections import defaultdict
 import numpy as np
 import pandas as pd
-import scipy.sparse as sp_sparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from joblib import Parallel, delayed
 from pyro.distributions import Dirichlet, DirichletMultinomial, Gamma, Multinomial
+import scanpy as sc
 from scipy.special import softmax
-from scipy.stats import chi2
+from scipy.stats import chi2, mannwhitneyu
 from sklearn.model_selection import KFold, train_test_split, StratifiedKFold
 from statsmodels.stats.multitest import multipletests
+from tqdm import tqdm
 
-from .utils import make_cluster_summation_cpu, relabel, group_normalize, filter_min_cells_per_feature, filter_min_cells_per_cluster, recluster, filter_min_global_proportion
+from .data import make_intron_group_summation_cpu, filter_min_cells_per_feature, filter_min_cells_per_intron_group, regroup, filter_min_global_proportion
 
 
 # original: from skbio.stats.composition import closure
@@ -124,9 +125,7 @@ def normalize(x):
 
 
 def run_regression(args):
-    cluster, y, cell_idx_a, cell_idx_b = args
-    if cluster % 100 == 0:
-        print("Testing intron cluster ", cluster)
+    intron_group, y, cell_idx_a, cell_idx_b = args
     cells_to_use = np.where(y.sum(axis=1) > 0)[0]
     y = y[cells_to_use]
     n_cells, n_classes = y.shape
@@ -148,7 +147,7 @@ def run_regression(args):
     model = lambda: DirichletMultinomialGLM(2, n_classes, init_A=init_A)
     ll, model = fit_model(model, x, y)
     if ll+1e-2 < ll_null:
-        raise Exception(f"WARNING: optimization failed for cluster {cluster}. ll_null={ll_null} ll_full={ll}")
+        raise Exception(f"WARNING: optimization failed for intron_group {intron_group}. ll_null={ll_null} ll_full={ll}")
     p_value = lrtest(ll_null, ll, n_classes - 1)
     A = model.get_full_A().cpu().detach().numpy()
     log_alpha = model.log_alpha.cpu().detach().numpy()
@@ -159,10 +158,10 @@ def run_regression(args):
     psi2 = normalize(conc * softmax(beta.sum(axis=1)))
     if np.isnan(p_value): p_value = 1.0
 
-    df_cluster = pd.DataFrame(dict(cluster=[cluster], p_value=[p_value], ll_null=[ll_null], ll=[ll], n_classes=[n_classes]))
+    df_intron_group = pd.DataFrame(dict(intron_group=[intron_group], p_value=[p_value], ll_null=[ll_null], ll=[ll], n_classes=[n_classes]))
     df_intron = pd.DataFrame(dict(psi_a=psi1, psi_b=psi2))
 
-    return df_cluster, df_intron
+    return df_intron_group, df_intron
 
 
 def _run_differential_splicing(
@@ -170,10 +169,10 @@ def _run_differential_splicing(
     cell_idx_a,
     cell_idx_b,
     device="cpu",
-    min_cells_per_cluster=None,
+    min_cells_per_intron_group=None,
     min_total_cells_per_intron=None,
     n_jobs=None,
-    do_recluster=False,
+    do_regroup=False,
     min_global_proportion=1e-3,
 ):
     n_a = len(cell_idx_a)
@@ -189,48 +188,43 @@ def _run_differential_splicing(
     if min_global_proportion is not None:
         adata = filter_min_global_proportion(adata, min_global_proportion)
         print(adata.shape)
-    if do_recluster:
-        adata = recluster(adata)
+    if do_regroup:
+        adata = regroup(adata)
         print(adata.shape)
-    if min_cells_per_cluster is not None:
-        adata = filter_min_cells_per_cluster(adata, min_cells_per_cluster, cell_idx_a)
-        adata = filter_min_cells_per_cluster(adata, min_cells_per_cluster, cell_idx_b)
+    if min_cells_per_intron_group is not None:
+        adata = filter_min_cells_per_intron_group(adata, min_cells_per_intron_group, cell_idx_a)
+        adata = filter_min_cells_per_intron_group(adata, min_cells_per_intron_group, cell_idx_b)
         print(adata.shape)
     if adata.shape[1] == 0: return pd.DataFrame(), pd.DataFrame()
 
-    adata.var = adata.var.reset_index(drop=True)
-    print("Number of intron clusters: ", len(adata.var.cluster.unique()))
+    print("Number of intron groups: ", len(adata.var.intron_group.unique()))
     print("Number of introns: ", len(adata.var))
 
-    intron_clusters = adata.var.cluster.values
-    all_intron_clusters = pd.unique(intron_clusters)
-    cluster_introns = defaultdict(list)
-    for i, c in enumerate(intron_clusters):
-        cluster_introns[c].append(i)
-
-    #print("subsetting to 2000")
-    #all_intron_clusters = all_intron_clusters[:1000]
+    intron_groups = adata.var.intron_group.values
+    all_intron_groups = pd.unique(intron_groups)
+    intron_group_introns = defaultdict(list)
+    for i, c in enumerate(intron_groups):
+        intron_group_introns[c].append(i)
 
     X = adata.X.toarray()  # for easier parallelization using Python's libraries
 
     if n_jobs is not None and n_jobs > 1:
-        dfs_cluster, dfs_intron = zip(
+        dfs_intron_group, dfs_intron = zip(
             *Parallel(n_jobs=n_jobs)(
-                delayed(run_regression)((c, X[:, cluster_introns[c]], cell_idx_a, cell_idx_b))
-                for c in all_intron_clusters
+                delayed(run_regression)((c, X[:, intron_group_introns[c]], cell_idx_a, cell_idx_b))
+                for c in tqdm(all_intron_groups)
             )
         )
     else:
-        dfs_cluster, dfs_intron = zip(*[
-            run_regression((c, X[:, cluster_introns[c]], cell_idx_a, cell_idx_b))
-            for c in all_intron_clusters
+        dfs_intron_group, dfs_intron = zip(*[
+            run_regression((c, X[:, intron_group_introns[c]], cell_idx_a, cell_idx_b))
+            for c in tqdm(all_intron_groups)
         ])
-    df_cluster = pd.concat(dfs_cluster, ignore_index=True)
+    df_intron_group = pd.concat(dfs_intron_group, ignore_index=True)
     df_intron = pd.concat(dfs_intron, ignore_index=True)
-    positions = np.concatenate([cluster_introns[c] for c in all_intron_clusters])
-    df_intron = pd.concat([adata.var.iloc[positions].reset_index(drop=True), df_intron], axis=1)
-    print("Done")
-    return df_cluster, df_intron
+    positions = np.concatenate([intron_group_introns[c] for c in all_intron_groups])
+    df_intron = pd.concat([adata.var.iloc[positions].reset_index(drop=False), df_intron], axis=1).set_index("index")
+    return df_intron_group, df_intron
 
 
 class MultinomialGLM(nn.Module):
@@ -342,46 +336,48 @@ def run_differential_splicing(
 ):
     print("sample sizes: ", len(cell_idx_a), len(cell_idx_b))
 
-    df_cluster, df_intron = _run_differential_splicing(
+    df_intron_group, df_intron = _run_differential_splicing(
         adata,
         cell_idx_a,
         cell_idx_b,
         **kwargs,
     )
-    if len(df_cluster) == 0: return df_cluster, df_intron
+    if len(df_intron_group) == 0: return df_intron_group, df_intron
     df_intron["delta_psi"] = df_intron["psi_a"] - df_intron["psi_b"]
     df_intron["lfc_psi"] = np.log2(df_intron["psi_a"] + 1e-9) - np.log2(df_intron["psi_b"] + 1e-9)
     df_intron["abs_delta_psi"] = df_intron.delta_psi.abs()
     df_intron["abs_lfc_psi"] = df_intron.lfc_psi.abs()
 
+    if "gene_id" not in df_intron.columns:
+        df_intron["gene_id"] = "NA"
     if "gene_name" not in df_intron.columns:
         df_intron["gene_name"] = "NA"
-    groupby = df_intron.groupby("cluster").agg({"gene_id": "first", "gene_name": "first", "abs_delta_psi": "max", "abs_lfc_psi": "max"})
+    groupby = df_intron.groupby("intron_group").agg({"gene_id": "first", "gene_name": "first", "abs_delta_psi": "max", "abs_lfc_psi": "max"})
     groupby = groupby.rename(columns={"abs_delta_psi": "max_abs_delta_psi", "abs_lfc_psi": "max_abs_lfc_psi"})
-    df_cluster = df_cluster.set_index("cluster").merge(groupby, left_index=True, right_index=True, how="inner")
-    df_cluster = df_cluster.sort_values(by="p_value")
-    df_cluster["ranking"] = np.arange(len(df_cluster))
+    df_intron_group = df_intron_group.set_index("intron_group").merge(groupby, left_index=True, right_index=True, how="inner")
+    df_intron_group = df_intron_group.sort_values(by="p_value")
+    df_intron_group["ranking"] = np.arange(len(df_intron_group))
 
     reject, pvals_corrected, _, _ = multipletests(
-        df_cluster.p_value.values, 0.05, "fdr_bh"
+        df_intron_group.p_value.values, 0.05, "fdr_bh"
     )
-    df_cluster["p_value_adj"] = pvals_corrected
+    df_intron_group["p_value_adj"] = pvals_corrected
 
-    return df_cluster, df_intron
+    return df_intron_group, df_intron
 
 
-def make_cluster_summation(clusters, device):
-    n_introns = len(clusters)
-    n_clusters = len(np.unique(clusters))
-    rows, cols = zip(*list(enumerate(clusters)))
+def make_intron_group_summation(intron_groups, device):
+    n_introns = len(intron_groups)
+    n_intron_groups = len(np.unique(intron_groups))
+    rows, cols = zip(*list(enumerate(intron_groups)))
     vals = np.ones(n_introns, dtype=int)
 
     I = torch.tensor([cols, rows], device=device, dtype=torch.long)
     V = torch.tensor(vals, device=device, dtype=torch.float)
-    cluster_summation = torch.sparse.FloatTensor(
-        I, V, torch.Size([n_clusters, n_introns])
+    intron_group_summation = torch.sparse.FloatTensor(
+        I, V, torch.Size([n_intron_groups, n_introns])
     )
-    return cluster_summation
+    return intron_group_summation
 
 
 class LassoDirichletMultinomialGLM(nn.Module):
@@ -525,3 +521,50 @@ class CVLassoDirichletMultinomialGLM:
         ll, model = fit_model(model, X, Y, device=device)
         self.ll = ll
         self.model = model
+
+
+def _run_differential_expression(adata, cell_idx_a, cell_idx_b, min_total_cells_per_gene):
+    cell_idx_all = np.concatenate([cell_idx_a, cell_idx_b])
+    print(adata.shape)
+    adata = adata[cell_idx_all].copy()
+    print(adata.shape)
+    total_cells_per_gene = (adata.X > 0).sum(axis=0).A1.ravel()
+    adata = adata[:, total_cells_per_gene >= min_total_cells_per_gene]
+    print(adata.shape)
+
+    sc.pp.normalize_total(adata, target_sum=1e4)
+    sc.pp.log1p(adata)
+
+    X_a = adata.X[: len(cell_idx_a)].toarray()
+    X_b = adata.X[len(cell_idx_a) :].toarray()
+    print(X_a.shape, X_b.shape)
+    diff_exp = pd.DataFrame(
+        dict(
+            gene=adata.var_names.values,
+            p_value=[
+                mannwhitneyu(X_a[:, i], X_b[:, i], alternative="two-sided").pvalue
+                for i in range(X_a.shape[1])
+            ],
+            lfc=np.log2(np.expm1(X_a).mean(axis=0) + 1e-9)
+            - np.log2(np.expm1(X_b).mean(axis=0) + 1e-9),
+        )
+    )
+    diff_exp["abs_lfc"] = diff_exp.lfc.abs()
+    diff_exp["sort_val"] = list(zip(diff_exp.p_value, -diff_exp.lfc.abs()))
+    diff_exp = diff_exp.sort_values(by="sort_val").drop("sort_val", 1)
+    diff_exp["ranking"] = np.arange(len(diff_exp))
+    return diff_exp
+
+
+def run_differential_expression(
+    adata, cell_idx_a, cell_idx_b, min_total_cells_per_gene=100
+):
+    print("sample sizes: ", len(cell_idx_a), len(cell_idx_b))
+    diff_exp = _run_differential_expression(
+        adata, cell_idx_a, cell_idx_b, min_total_cells_per_gene
+    )
+    reject, pvals_corrected, _, _ = multipletests(
+        diff_exp.p_value.values, 0.05, "fdr_bh"
+    )
+    diff_exp["p_value_adj"] = pvals_corrected
+    return diff_exp

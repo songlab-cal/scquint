@@ -14,12 +14,13 @@ install_requires = [
     "numpy",
     "pandas",
     "scipy",
+    "tqdm",
 ]
 
 
 setup(
     name='scquint',
-    version='0.2',
+    version='0.3',
     description='scQuint',
     url='http://github.com/songlab-cal/scquint',
     author='Gonzalo Benegas',
