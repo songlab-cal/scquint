@@ -208,7 +208,7 @@ def _run_differential_splicing(
 
     X = adata.X.toarray()  # for easier parallelization using Python's libraries
 
-    if n_jobs is not None and n_jobs > 1:
+    if n_jobs is not None and n_jobs != 1:
         dfs_intron_group, dfs_intron = zip(
             *Parallel(n_jobs=n_jobs)(
                 delayed(run_regression)((c, X[:, intron_group_introns[c]], cell_idx_a, cell_idx_b))
