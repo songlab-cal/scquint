@@ -568,3 +568,78 @@ def run_differential_expression(
     )
     diff_exp["p_value_adj"] = pvals_corrected
     return diff_exp
+
+
+def run_differential_splicing_for_each_group(
+    adata_spl,
+    groupby,
+    groups=None,
+    subset_to_groups=False,
+    **kwargs,
+):
+    if subset_to_groups:
+        assert(groups is not None)
+        adata_spl = adata_spl[adata_spl.obs[groupby].isin(groups)]
+    
+    all_intron_groups = []
+    all_introns = []
+
+    if groups is None:
+        groups = adata_spl.obs[groupby].unique()
+
+    for g in groups:
+        print(g)
+        cell_idx_a = np.where(adata_spl.obs[groupby]==g)[0]
+        cell_idx_b = np.where(adata_spl.obs[groupby]!=g)[0]
+        intron_groups, introns = run_differential_splicing(
+            adata_spl, cell_idx_a, cell_idx_b, **kwargs, 
+        )
+        intron_groups["test_group"] = g
+        introns["test_group"] = g
+        intron_groups["name"] = intron_groups.index
+        introns["name"] = introns.index
+        all_intron_groups.append(intron_groups)
+        all_introns.append(introns)
+
+    all_intron_groups = pd.concat(all_intron_groups, ignore_index=True)
+    all_introns = pd.concat(all_introns, ignore_index=True)
+    return all_intron_groups, all_introns
+
+
+def find_marker_introns(intron_groups, introns, n=10, max_p_value_adj=0.05, min_delta_psi=0.05):
+    intron_groups = intron_groups[intron_groups.p_value_adj <= max_p_value_adj]
+    significant_groups_per_ig = intron_groups.groupby(["name"]).test_group.unique()
+    groups = intron_groups.test_group.unique()
+    
+    def check_sig(i):
+        return (
+            i.intron_group in significant_groups_per_ig.index and
+            i.test_group in significant_groups_per_ig.loc[i.intron_group] and
+            i.delta_psi >= min_delta_psi
+        )
+    introns = introns[introns.apply(check_sig, axis=1)]
+
+    marker_introns = defaultdict(list)
+    introns = introns.sample(frac=1.0, random_state=42).sort_values("delta_psi", ascending=False).drop_duplicates("gene_name")
+    i = 0
+    while sum(map(len, marker_introns.values())) < n*len(groups) and i < len(introns):
+        intron = introns.iloc[i]
+        if len(marker_introns[intron.test_group]) < n:
+            marker_introns[intron.test_group].append(intron["name"])
+        i += 1
+    return marker_introns
+
+
+def mask_PSI(adata_spl, marker_introns, groupby, min_cells=10):
+    marker_introns_list = sum(marker_introns.values(), [])
+    adata_spl = adata_spl[:, marker_introns_list]
+    PSI_raw = pd.DataFrame(adata_spl.layers["PSI_raw"])
+    n_cells_per_group = PSI_raw.notna().groupby(adata_spl.obs[groupby].values).sum()
+    PSI_raw_masked = adata_spl.layers["PSI_raw"].copy()
+    for g in n_cells_per_group.index:
+        idx_cells = np.where(adata_spl.obs[groupby]==g)[0]
+        for i in n_cells_per_group.columns:
+            if n_cells_per_group.loc[g, i] < min_cells:
+                PSI_raw_masked[idx_cells, i] = np.nan
+    adata_spl.layers["PSI_raw_masked"] = PSI_raw_masked
+    return adata_spl

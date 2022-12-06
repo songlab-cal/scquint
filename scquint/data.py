@@ -7,12 +7,15 @@ import scanpy as sc
 import scipy.sparse as sp_sparse
 
 
-def load_adata_from_starsolo(input_dir):
+def load_adata_from_starsolo(
+    input_dir,
+    var_filename="features.tsv",  # other values: SJ.out.tab
+):
     adata = sc.read_mtx(os.path.join(input_dir, "matrix.mtx")).T
     obs = pd.read_csv(os.path.join(input_dir, "barcodes.tsv"), header=None).set_index(0)
     obs.index.name = None
     var = pd.read_csv(
-        os.path.join(input_dir, "SJ.out.tab"),
+        os.path.join(input_dir, var_filename),
         sep="\t",
         header=None,
         names=[

@@ -20,7 +20,7 @@ install_requires = [
 
 setup(
     name='scquint',
-    version='0.3.2',
+    version='0.3.3',
     description='scQuint',
     url='http://github.com/songlab-cal/scquint',
     author='Gonzalo Benegas',
