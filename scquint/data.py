@@ -146,6 +146,15 @@ def group_introns(adata, by="three_prime", filter_unique_gene_per_group=True):
             + intron.strand,
             axis=1,
         )
+    elif by == "five_prime":
+        adata.var["intron_group"] = adata.var.apply(
+            lambda intron: intron.chromosome
+            + "_"
+            + (str(intron.end) if intron.strand == "-" else str(intron.start))
+            + "_"
+            + intron.strand,
+            axis=1,
+        )
     elif by == "gene":
         adata.var["intron_group"] = adata.var.gene_id
     else:
