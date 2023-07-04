@@ -35,7 +35,11 @@ from scquint.differential_splicing import run_differential_splicing
 
 diff_spl_intron_groups, diff_spl_introns = run_differential_splicing(adata, cell_idx_a, cell_idx_b)
 ```
-See `differential_splicing_example.ipynb` for more details. <a target="_blank" href="https://colab.research.google.com/github/songlab-cal/scquint/blob/main/differential_splicing_example.ipynb">
+See `differential_splicing_example.ipynb` for more details using Tabula Muris. <a target="_blank" href="https://colab.research.google.com/github/songlab-cal/scquint/blob/main/differential_splicing_example.ipynb">
+  <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/>
+</a>
+
+See `differential_splicing_example_cortex.ipynb` for more details using BICCN mouse primary motor cortex. <a target="_blank" href="https://colab.research.google.com/github/songlab-cal/scquint/blob/main/differential_splicing_example_cortex.ipynb">
   <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/>
 </a>
 
