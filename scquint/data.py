@@ -162,8 +162,8 @@ def group_introns(adata, by="three_prime", filter_unique_gene_per_group=True):
 
     intron_group_sizes = (
         adata.var.intron_group.value_counts()
+        .rename("intron_group_size")
         .to_frame()
-        .rename(columns={"intron_group": "intron_group_size"})
     )
     adata.var = adata.var.merge(
         intron_group_sizes, how="left", left_on="intron_group", right_index=True
